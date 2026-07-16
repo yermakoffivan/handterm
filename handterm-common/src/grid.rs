@@ -1635,6 +1635,7 @@ mod tests {
         g.write_bytes(b"abcdefghij");
 
         assert_eq!(g.scrollback_len(), 0);
+        assert_eq!(g.history_rows(), 1);
         assert_eq!(g.cell_char(0, 0), 'e');
         assert_eq!(g.cell_char(0, 3), 'h');
         assert_eq!(g.cell_char(1, 0), 'i');

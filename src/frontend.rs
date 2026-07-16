@@ -924,6 +924,7 @@ pub fn visual_signature<T: TerminalView + ?Sized>(terminal: &T) -> u64 {
     mix(&mut hash, terminal.cursor_visible() as u64);
     mix(&mut hash, terminal.cursor_style() as u64);
     mix(&mut hash, grid.scroll_offset as u64);
+    mix(&mut hash, grid.history_rows());
 
     if let Some(selection) = grid.selection {
         mix(&mut hash, 1);
@@ -1219,6 +1220,17 @@ mod tests {
             .set_cell_with_grapheme(0, 0, crate::grid::Cell::BLANK, Some("♠️".into()));
         let with_suit = visual_signature(&terminal);
         assert_ne!(with_heart, with_suit);
+    }
+
+    #[test]
+    fn visual_signature_changes_when_output_scrolls_without_new_cells() {
+        let mut terminal = Terminal::new_with_scrollback(2, 1, 8);
+        let before = visual_signature(&terminal);
+
+        terminal.process(b"\n");
+
+        assert_eq!(terminal.grid.history_rows(), 1);
+        assert_ne!(visual_signature(&terminal), before);
     }
 
     #[test]

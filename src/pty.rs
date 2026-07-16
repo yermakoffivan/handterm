@@ -205,12 +205,42 @@ impl PtyChild {
         envs: &[ChildEnvVar<'_>],
         cwd: Option<&Path>,
     ) -> Result<Self> {
+        Self::spawn_default_shell_with_command_env_and_cwd_and_pixels(
+            columns, rows, 0, 0, command, envs, cwd,
+        )
+    }
+
+    pub fn spawn_default_shell_with_command_env_and_cwd_and_pixels(
+        columns: u16,
+        rows: u16,
+        pixel_width: u32,
+        pixel_height: u32,
+        command: Option<&str>,
+        envs: &[ChildEnvVar<'_>],
+        cwd: Option<&Path>,
+    ) -> Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         match command.filter(|command| !command.trim().is_empty()) {
-            Some(command) => {
-                Self::spawn_shell_inner(&shell, Some(command), columns, rows, envs, cwd)
-            }
-            None => Self::spawn_shell_inner(&shell, None, columns, rows, envs, cwd),
+            Some(command) => Self::spawn_shell_inner(
+                &shell,
+                Some(command),
+                columns,
+                rows,
+                pixel_width,
+                pixel_height,
+                envs,
+                cwd,
+            ),
+            None => Self::spawn_shell_inner(
+                &shell,
+                None,
+                columns,
+                rows,
+                pixel_width,
+                pixel_height,
+                envs,
+                cwd,
+            ),
         }
     }
 
@@ -224,7 +254,7 @@ impl PtyChild {
         rows: u16,
         envs: &[ChildEnvVar<'_>],
     ) -> Result<Self> {
-        Self::spawn_shell_inner(shell_path, None, columns, rows, envs, None)
+        Self::spawn_shell_inner(shell_path, None, columns, rows, 0, 0, envs, None)
     }
 
     pub fn spawn_shell_command(
@@ -243,7 +273,7 @@ impl PtyChild {
         rows: u16,
         envs: &[ChildEnvVar<'_>],
     ) -> Result<Self> {
-        Self::spawn_shell_inner(shell_path, Some(command), columns, rows, envs, None)
+        Self::spawn_shell_inner(shell_path, Some(command), columns, rows, 0, 0, envs, None)
     }
 
     fn spawn_shell_inner(
@@ -251,6 +281,8 @@ impl PtyChild {
         command: Option<&str>,
         columns: u16,
         rows: u16,
+        pixel_width: u32,
+        pixel_height: u32,
         envs: &[ChildEnvVar<'_>],
         cwd: Option<&Path>,
     ) -> Result<Self> {
@@ -264,12 +296,7 @@ impl PtyChild {
         // a launched program from a child that immediately failed to launch.
         let (error_read, error_write) = cloexec_pipe().context("exec status pipe failed")?;
 
-        let ws = Winsize {
-            ws_row: rows,
-            ws_col: columns,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
+        let ws = make_winsize(columns, rows, pixel_width, pixel_height);
 
         let result = match unsafe { forkpty(Some(&ws), None) } {
             Ok(result) => result,
@@ -364,19 +391,33 @@ impl PtyChild {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        use nix::libc::{TIOCSWINSZ, ioctl, winsize};
+        self.resize_with_pixels(cols, rows, 0, 0)
+    }
+
+    pub fn resize_with_pixels(
+        &self,
+        cols: u16,
+        rows: u16,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> Result<()> {
+        use nix::libc::{TIOCSWINSZ, ioctl};
         use std::os::fd::AsRawFd;
-        let ws = winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
+        let ws = make_winsize(cols, rows, pixel_width, pixel_height);
         let ret = unsafe { ioctl(self.master_fd.as_raw_fd(), TIOCSWINSZ, &ws) };
         if ret == -1 {
             anyhow::bail!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error());
         }
         Ok(())
+    }
+}
+
+fn make_winsize(columns: u16, rows: u16, pixel_width: u32, pixel_height: u32) -> Winsize {
+    Winsize {
+        ws_row: rows,
+        ws_col: columns,
+        ws_xpixel: pixel_width.min(u16::MAX as u32) as u16,
+        ws_ypixel: pixel_height.min(u16::MAX as u32) as u16,
     }
 }
 
@@ -450,8 +491,18 @@ fn read_launch_error(fd: i32) -> Result<Option<(&'static str, i32)>> {
 
 #[cfg(test)]
 mod tests {
-    use super::PtyChild;
+    use super::{PtyChild, make_winsize};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn winsize_preserves_cell_and_pixel_dimensions() {
+        let size = make_winsize(120, 40, 1080, 720);
+        assert_eq!((size.ws_col, size.ws_row), (120, 40));
+        assert_eq!((size.ws_xpixel, size.ws_ypixel), (1080, 720));
+
+        let clamped = make_winsize(1, 1, u32::MAX, u32::MAX);
+        assert_eq!((clamped.ws_xpixel, clamped.ws_ypixel), (u16::MAX, u16::MAX));
+    }
 
     /// Read from the pty until `expected` appears in the output, yielding
     /// briefly between empty reads so parallel test threads are not starved.

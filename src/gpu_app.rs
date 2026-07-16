@@ -510,9 +510,15 @@ impl GpuApp {
             .collect::<Vec<_>>();
         let before_pty = Instant::now();
         let added_window_cwd = (existing_windows > 0).then(dirs::home_dir).flatten();
-        let pty = PtyChild::spawn_default_shell_with_command_env_and_cwd(
+        let pty_pixel_width =
+            u32::from(cols).saturating_mul(u32::try_from(cell_width).unwrap_or(u32::MAX));
+        let pty_pixel_height =
+            u32::from(rows).saturating_mul(u32::try_from(cell_height).unwrap_or(u32::MAX));
+        let pty = PtyChild::spawn_default_shell_with_command_env_and_cwd_and_pixels(
             cols,
             rows,
+            pty_pixel_width,
+            pty_pixel_height,
             if existing_windows == 0 {
                 self.startup_command.as_deref()
             } else {
@@ -1057,8 +1063,17 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
 
                         if new_cols != state.terminal.cols || new_rows != state.terminal.rows {
                             state.terminal.resize(new_cols, new_rows);
-                            let _ = state.pty.resize(new_cols, new_rows);
                         }
+                        let pty_pixel_width = u32::from(new_cols)
+                            .saturating_mul(u32::try_from(atlas.cell_width).unwrap_or(u32::MAX));
+                        let pty_pixel_height = u32::from(new_rows)
+                            .saturating_mul(u32::try_from(atlas.cell_height).unwrap_or(u32::MAX));
+                        let _ = state.pty.resize_with_pixels(
+                            new_cols,
+                            new_rows,
+                            pty_pixel_width,
+                            pty_pixel_height,
+                        );
 
                         state.renderer.window.request_redraw();
                     }

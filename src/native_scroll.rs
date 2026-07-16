@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -79,6 +79,8 @@ pub struct NativeScrollBridge {
     snapshot: Arc<Mutex<PaneSnapshot>>,
     command_tx: Sender<HostToApp>,
     connected: Arc<AtomicBool>,
+    connection_generation: Arc<AtomicU64>,
+    observed_connection_generation: u64,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     chat_residual: f32,
@@ -104,6 +106,7 @@ impl NativeScrollBridge {
 
         let snapshot = Arc::new(Mutex::new(PaneSnapshot::default()));
         let connected = Arc::new(AtomicBool::new(false));
+        let connection_generation = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let (command_tx, command_rx) = mpsc::channel();
 
@@ -111,6 +114,7 @@ impl NativeScrollBridge {
             listener,
             snapshot.clone(),
             connected.clone(),
+            connection_generation.clone(),
             stop.clone(),
             command_rx,
         );
@@ -120,6 +124,8 @@ impl NativeScrollBridge {
             snapshot,
             command_tx,
             connected,
+            connection_generation,
+            observed_connection_generation: 0,
             stop,
             thread: Some(thread),
             chat_residual: 0.0,
@@ -140,8 +146,15 @@ impl NativeScrollBridge {
     }
 
     pub fn send_scroll_delta(&mut self, pane: PaneKind, delta_rows: f32) -> bool {
-        if !self.connected.load(Ordering::Relaxed) {
+        if !self.connected.load(Ordering::Acquire) {
             return false;
+        }
+
+        let generation = self.connection_generation.load(Ordering::Relaxed);
+        if generation != self.observed_connection_generation {
+            self.observed_connection_generation = generation;
+            self.chat_residual = 0.0;
+            self.side_panel_residual = 0.0;
         }
 
         let residual = match pane {
@@ -227,12 +240,22 @@ fn spawn_bridge_thread(
     listener: UnixListener,
     snapshot: Arc<Mutex<PaneSnapshot>>,
     connected: Arc<AtomicBool>,
+    connection_generation: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     command_rx: Receiver<HostToApp>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("handterm-native-scroll".to_string())
-        .spawn(move || bridge_thread(listener, snapshot, connected, stop, command_rx))
+        .spawn(move || {
+            bridge_thread(
+                listener,
+                snapshot,
+                connected,
+                connection_generation,
+                stop,
+                command_rx,
+            )
+        })
         .expect("native scroll bridge thread should spawn")
 }
 
@@ -240,6 +263,7 @@ fn bridge_thread(
     listener: UnixListener,
     snapshot: Arc<Mutex<PaneSnapshot>>,
     connected: Arc<AtomicBool>,
+    connection_generation: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     command_rx: Receiver<HostToApp>,
 ) {
@@ -252,10 +276,12 @@ fn bridge_thread(
                 Ok((accepted, _)) => {
                     let _ = accepted.set_nonblocking(true);
                     read_buf.clear();
+                    while command_rx.try_recv().is_ok() {}
                     if let Ok(mut current) = snapshot.lock() {
                         current.panes.clear();
                     }
-                    connected.store(true, Ordering::Relaxed);
+                    connection_generation.fetch_add(1, Ordering::Relaxed);
+                    connected.store(true, Ordering::Release);
                     stream = Some(accepted);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -495,6 +521,47 @@ mod tests {
         assert!(!bridge.connected.load(Ordering::Relaxed));
         assert!(!bridge.send_scroll_delta(PaneKind::Chat, 1.0));
         assert_eq!(bridge.chat_residual, 0.0);
+    }
+
+    #[test]
+    fn new_connection_discards_stale_commands_and_fractional_residuals() {
+        let mut bridge = NativeScrollBridge::new(999_995).expect("bridge should initialize");
+        let socket_path = bridge
+            .child_envs(999_995)
+            .into_iter()
+            .find_map(|(key, value)| (key == ENV_SOCKET).then_some(value))
+            .expect("socket env should be present");
+
+        bridge
+            .command_tx
+            .send(HostToApp::Scroll {
+                pane: PaneKind::Chat,
+                delta: 7,
+            })
+            .expect("stale command should queue before connection");
+        bridge.chat_residual = 0.75;
+
+        let mut stream = UnixStream::connect(socket_path).expect("client should connect");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("read timeout should set");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline && !bridge.connected.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(bridge.connected.load(Ordering::Acquire));
+
+        assert!(bridge.send_scroll_delta(PaneKind::Chat, 0.25));
+        assert!((bridge.chat_residual - 0.25).abs() < f32::EPSILON);
+
+        let mut byte = [0u8; 1];
+        let error = stream
+            .read(&mut byte)
+            .expect_err("stale command must not replay to the new client");
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
     }
 
     #[test]

@@ -81,7 +81,21 @@ pub fn render_terminal_to_buffer(
     let grid = terminal.grid();
     let has_selection = grid.selection.is_some();
     let scrolled = grid.scroll_offset > 0;
-    let full_redraw = grid.all_dirty || has_selection || scrolled || has_complex_dirty_cells(grid);
+    // The software buffer persists between frames. Reblending a translucent
+    // image over its previous pixels accumulates opacity, while the ligature
+    // row-clear pass can erase an image drawn earlier in the frame. Rebuild the
+    // complete underlay whenever an image is visible so background -> image ->
+    // text ordering is deterministic on every frame.
+    let has_kitty_images = !terminal.kitty_placements().is_empty() || {
+        let mut virtual_cells = Vec::new();
+        fill_kitty_virtual_cells(grid, grid.scroll_offset, grid.rows, &mut virtual_cells);
+        !virtual_cells.is_empty()
+    };
+    let full_redraw = grid.all_dirty
+        || has_selection
+        || scrolled
+        || has_kitty_images
+        || has_complex_dirty_cells(grid);
     if full_redraw {
         buffer.fill(base_bg);
     }
@@ -1068,6 +1082,31 @@ mod tests {
 
         let expected = 0x8f1f2f;
         assert_eq!(renderer.pixels[0], expected);
+    }
+
+    #[test]
+    fn kitty_image_pixels_are_stable_across_incremental_frames() {
+        let config = AppConfig::default();
+        let cols = 2;
+        let rows = 1;
+        let mut atlas = new_atlas(&config);
+        let mut terminal = Terminal::new(cols, rows);
+        terminal.cursor_visible = false;
+        let mut renderer = OffscreenRenderer::new(cols, rows, &atlas);
+
+        let mut cell = crate::grid::Cell::BLANK;
+        cell.ch = ' ' as u32;
+        cell.bg = crate::grid::COLOR_FLAG_RGB | 0x20_40_60;
+        terminal.grid.set_cell(0, 0, cell);
+        terminal.process(b"\x1b[H\x1b_Ga=T,i=5,f=32,s=1,v=1,c=1,r=1;/wAAgA==\x1b\\");
+
+        renderer.render(&mut terminal, &mut atlas, &config);
+        let first = renderer.pixels[0];
+        terminal.grid.mark_cell_dirty(0, 1);
+        renderer.render(&mut terminal, &mut atlas, &config);
+
+        assert_eq!(first, 0x8f1f2f);
+        assert_eq!(renderer.pixels[0], first);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use winit::dpi::{PhysicalPosition, PhysicalSize, Size};
@@ -30,6 +31,7 @@ struct Uniforms {
 
 const ATLAS_WIDTH: u32 = 2048;
 const ATLAS_HEIGHT: u32 = 1024;
+static NEXT_IMAGE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
 fn atlas_dimensions_fit(width: u32, height: u32) -> bool {
     width <= ATLAS_WIDTH && height <= ATLAS_HEIGHT
@@ -40,6 +42,26 @@ fn image_instance_buffer_size(instance_capacity: usize) -> u64 {
         .ok()
         .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<ImageInstance>() as u64))
         .expect("image instance buffer size overflow")
+}
+
+fn image_instance_limit(max_buffer_size: u64) -> usize {
+    let by_buffer = max_buffer_size / std::mem::size_of::<ImageInstance>() as u64;
+    usize::try_from(by_buffer)
+        .unwrap_or(usize::MAX)
+        .min(u32::MAX as usize)
+}
+
+fn grown_image_instance_capacity(required: usize, max_buffer_size: u64) -> usize {
+    let limit = image_instance_limit(max_buffer_size);
+    let required = required.min(limit);
+    if required == 0 {
+        return 0;
+    }
+    required
+        .checked_next_power_of_two()
+        .unwrap_or(limit)
+        .min(limit)
+        .max(required)
 }
 
 pub(crate) struct GpuGlyphEntry {
@@ -57,6 +79,11 @@ pub(crate) struct GpuImageEntry {
     y: u32,
     width: u32,
     height: u32,
+    generation: u64,
+}
+
+fn image_entry_can_reuse(entry: &GpuImageEntry, width: u32, height: u32) -> bool {
+    entry.width == width && entry.height == height
 }
 
 pub struct SharedAtlasState {
@@ -64,11 +91,10 @@ pub struct SharedAtlasState {
     pub(crate) atlas_view: wgpu::TextureView,
     pub(crate) glyph_map: HashMap<u32, GpuGlyphEntry>,
     pub(crate) grapheme_map: HashMap<Box<str>, GpuGlyphEntry>,
-    pub(crate) image_map: HashMap<u32, GpuImageEntry>,
+    pub(crate) image_map: HashMap<(u64, u32), GpuImageEntry>,
     pub(crate) atlas_cursor_x: u32,
     pub(crate) atlas_cursor_y: u32,
     pub(crate) atlas_row_height: u32,
-    pub(crate) last_kitty_generation: u64,
 }
 
 pub struct SharedGpuContext {
@@ -112,7 +138,6 @@ fn create_shared_atlas_state(device: &wgpu::Device) -> (SharedAtlasState, Durati
             atlas_cursor_x: 0,
             atlas_cursor_y: 0,
             atlas_row_height: 0,
-            last_kitty_generation: 0,
         },
         start.elapsed(),
     )
@@ -150,6 +175,7 @@ pub struct GpuSurfaceState {
     image_instance_buffer: wgpu::Buffer,
     max_instances: usize,
     max_image_instances: usize,
+    image_namespace: u64,
     frame_cells: Vec<CellInfo>,
     text_batches: FrameTextBatches,
     image_instances: Vec<ImageInstance>,
@@ -784,7 +810,8 @@ pub fn create_surface_state_for_window_with_shared_profiled_with_defaults(
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let max_image_instances = (config.window.columns as usize) * (config.window.rows as usize);
+    let max_image_instances = ((config.window.columns as usize) * (config.window.rows as usize))
+        .min(image_instance_limit(shared.device.limits().max_buffer_size));
     let image_instance_buffer = shared.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("image_instances"),
         size: image_instance_buffer_size(max_image_instances),
@@ -831,6 +858,7 @@ pub fn create_surface_state_for_window_with_shared_profiled_with_defaults(
             image_instance_buffer,
             max_instances,
             max_image_instances,
+            image_namespace: NEXT_IMAGE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             frame_cells: Vec::with_capacity(max_instances),
             text_batches: FrameTextBatches {
                 bg_instances: Vec::with_capacity(max_instances),
@@ -916,15 +944,18 @@ pub fn resize_surface_state(
             .reserve(needed.saturating_sub(state.frame_cells.capacity()));
     }
 
-    let needed_images = (cols as usize) * (rows as usize);
+    let needed_images = ((cols as usize) * (rows as usize)).min(image_instance_limit(
+        state.shared.device.limits().max_buffer_size,
+    ));
     if needed_images > state.max_image_instances {
-        state.max_image_instances = needed_images;
-        state.image_instance_buffer = state.shared.device.create_buffer(&wgpu::BufferDescriptor {
+        let image_instance_buffer = state.shared.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("image_instances"),
             size: image_instance_buffer_size(needed_images),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        state.image_instance_buffer = image_instance_buffer;
+        state.max_image_instances = needed_images;
         state
             .image_instances
             .reserve(needed_images.saturating_sub(state.image_instances.capacity()));
@@ -1123,6 +1154,7 @@ pub fn render_surface_state_profiled_with_scroll(
             ensure_kitty_image_in_atlas(
                 &mut atlas_state,
                 &state.shared.queue,
+                state.image_namespace,
                 terminal,
                 placement.image_id,
             )
@@ -1152,6 +1184,7 @@ pub fn render_surface_state_profiled_with_scroll(
             ensure_kitty_image_in_atlas(
                 &mut atlas_state,
                 &state.shared.queue,
+                state.image_namespace,
                 terminal,
                 virtual_cell.image_id,
             )
@@ -1164,14 +1197,22 @@ pub fn render_surface_state_profiled_with_scroll(
         },
     );
 
+    let max_supported_image_instances =
+        image_instance_limit(state.shared.device.limits().max_buffer_size);
+    image_instances.truncate(max_supported_image_instances);
     if image_instances.len() > state.max_image_instances {
-        state.max_image_instances = image_instances.len().next_power_of_two();
-        state.image_instance_buffer = state.shared.device.create_buffer(&wgpu::BufferDescriptor {
+        let new_capacity = grown_image_instance_capacity(
+            image_instances.len(),
+            state.shared.device.limits().max_buffer_size,
+        );
+        let image_instance_buffer = state.shared.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("image_instances"),
-            size: image_instance_buffer_size(state.max_image_instances),
+            size: image_instance_buffer_size(new_capacity),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        state.image_instance_buffer = image_instance_buffer;
+        state.max_image_instances = new_capacity;
     }
     drop(atlas_state);
 
@@ -1539,18 +1580,12 @@ fn ensure_grapheme_in_atlas<'a>(
 fn ensure_kitty_image_in_atlas<'a>(
     atlas_state: &'a mut SharedAtlasState,
     queue: &wgpu::Queue,
+    image_namespace: u64,
     terminal: &impl TerminalView,
     image_id: u32,
 ) -> Option<&'a GpuImageEntry> {
-    if atlas_state.last_kitty_generation != terminal.kitty_generation() {
-        atlas_state.image_map.clear();
-        atlas_state.last_kitty_generation = terminal.kitty_generation();
-    }
-
-    if atlas_state.image_map.contains_key(&image_id) {
-        return atlas_state.image_map.get(&image_id);
-    }
-
+    let key = (image_namespace, image_id);
+    let generation = terminal.kitty_generation();
     let image = terminal.kitty_image(image_id)?;
     if image.width == 0 || image.height == 0 {
         return None;
@@ -1561,6 +1596,41 @@ fn ensure_kitty_image_in_atlas<'a>(
     if !atlas_dimensions_fit(image.width, image.height) {
         return None;
     }
+
+    if let Some(entry) = atlas_state.image_map.get(&key) {
+        if entry.generation == generation {
+            return atlas_state.image_map.get(&key);
+        }
+        if image_entry_can_reuse(entry, image.width, image.height) {
+            let (x, y) = (entry.x, entry.y);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &atlas_state.atlas_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &image.data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(image.width * 4),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: image.width,
+                    height: image.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            atlas_state
+                .image_map
+                .get_mut(&key)
+                .expect("reusable image cache entry disappeared")
+                .generation = generation;
+            return atlas_state.image_map.get(&key);
+        }
+    }
+    atlas_state.image_map.remove(&key);
 
     if atlas_state.atlas_cursor_x + image.width > ATLAS_WIDTH {
         atlas_state.atlas_cursor_x = 0;
@@ -1600,11 +1670,12 @@ fn ensure_kitty_image_in_atlas<'a>(
         y: atlas_state.atlas_cursor_y,
         width: image.width,
         height: image.height,
+        generation,
     };
     atlas_state.atlas_cursor_x += image.width + 1;
     atlas_state.atlas_row_height = atlas_state.atlas_row_height.max(image.height + 1);
-    atlas_state.image_map.insert(image_id, entry);
-    atlas_state.image_map.get(&image_id)
+    atlas_state.image_map.insert(key, entry);
+    atlas_state.image_map.get(&key)
 }
 
 fn select_surface_format(

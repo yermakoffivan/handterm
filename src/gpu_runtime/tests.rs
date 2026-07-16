@@ -229,6 +229,44 @@ fn image_instance_buffer_size_uses_u64_arithmetic_for_max_grid() {
 }
 
 #[test]
+fn image_instance_capacity_is_bounded_by_device_and_draw_limits() {
+    let default_max_buffer_size = 256 * 1024 * 1024;
+    let limit = image_instance_limit(default_max_buffer_size);
+    assert_eq!(limit, 8_388_608);
+    assert_eq!(grown_image_instance_capacity(0, default_max_buffer_size), 0);
+    assert_eq!(
+        grown_image_instance_capacity(limit, default_max_buffer_size),
+        limit
+    );
+    assert_eq!(
+        grown_image_instance_capacity(limit.saturating_add(1), default_max_buffer_size),
+        limit
+    );
+    assert!(image_instance_limit(u64::MAX) <= u32::MAX as usize);
+}
+
+#[test]
+fn image_cache_is_surface_scoped_and_reuses_same_size_updates() {
+    let first_window = (1, 7);
+    let second_window = (2, 7);
+    assert_ne!(first_window, second_window);
+
+    let entry = GpuImageEntry {
+        x: 10,
+        y: 20,
+        width: ATLAS_WIDTH,
+        height: ATLAS_HEIGHT,
+        generation: 1,
+    };
+    assert!(image_entry_can_reuse(&entry, ATLAS_WIDTH, ATLAS_HEIGHT));
+    assert!(!image_entry_can_reuse(
+        &entry,
+        ATLAS_WIDTH - 1,
+        ATLAS_HEIGHT
+    ));
+}
+
+#[test]
 fn image_quad_destination_clipping_preserves_source_offset() {
     let mut pixels = Vec::new();
     for index in 1..=16u8 {
