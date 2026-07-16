@@ -237,7 +237,8 @@ pub(crate) fn build_cell_instances(
     let mut glyph_left_pad = 0.0f32;
     let mut glyph_top_pad = 0.0f32;
 
-    if !is_kitty_unicode_placeholder(ci.ch, ci.grapheme.as_deref())
+    let is_image_placeholder = is_kitty_unicode_placeholder(ci.ch, ci.grapheme.as_deref());
+    if !is_image_placeholder
         && (ci.ch > 0x20 || ci.grapheme.is_some())
         && let Some(entry) = glyph_entry
         && entry.width > 0
@@ -252,18 +253,20 @@ pub(crate) fn build_cell_instances(
         glyph_top_pad = entry.top_pad as f32;
     }
 
-    if ci.cell.attrs & crate::grid::ATTR_UNDERLINE != 0 {
-        use crate::grid::UnderlineStyle;
-        match ci.cell.underline_style {
-            UnderlineStyle::None | UnderlineStyle::Single => flags |= FLAG_UNDERLINE,
-            UnderlineStyle::Double => flags |= FLAG_DOUBLE_UL,
-            UnderlineStyle::Curly => flags |= FLAG_CURLY_UL,
-            UnderlineStyle::Dotted => flags |= FLAG_DOTTED_UL,
-            UnderlineStyle::Dashed => flags |= FLAG_DASHED_UL,
+    if !is_image_placeholder {
+        if ci.cell.attrs & crate::grid::ATTR_UNDERLINE != 0 {
+            use crate::grid::UnderlineStyle;
+            match ci.cell.underline_style {
+                UnderlineStyle::None | UnderlineStyle::Single => flags |= FLAG_UNDERLINE,
+                UnderlineStyle::Double => flags |= FLAG_DOUBLE_UL,
+                UnderlineStyle::Curly => flags |= FLAG_CURLY_UL,
+                UnderlineStyle::Dotted => flags |= FLAG_DOTTED_UL,
+                UnderlineStyle::Dashed => flags |= FLAG_DASHED_UL,
+            }
         }
-    }
-    if ci.cell.attrs & crate::grid::ATTR_STRIKETHROUGH != 0 {
-        flags |= FLAG_STRIKETHROUGH;
+        if ci.cell.attrs & crate::grid::ATTR_STRIKETHROUGH != 0 {
+            flags |= FLAG_STRIKETHROUGH;
+        }
     }
 
     // Per-cell pixel origin and advance width, computed once and reused below.
@@ -717,17 +720,27 @@ mod tests {
 
     #[test]
     fn kitty_placeholder_never_generates_a_fallback_glyph_instance() {
+        let mut cell = crate::grid::Cell::BLANK;
+        cell.attrs = crate::grid::ATTR_UNDERLINE
+            | crate::grid::ATTR_STRIKETHROUGH
+            | crate::grid::ATTR_HAS_UCOLOR;
+        cell.underline_color = crate::grid::COLOR_FLAG_RGB | 0x000007;
         let ci = CellInfo {
             row: 0,
             col: 0,
             ch: crate::kitty_placeholders::KITTY_UNICODE_PLACEHOLDER,
             grapheme: Some("\u{10eeee}\u{0305}\u{0305}\u{0305}".into()),
             cells: 1,
-            cell: crate::grid::Cell::BLANK,
+            cell,
             selected: false,
             is_cursor_block: false,
             cursor_style: None,
         };
+        let batches = build_text_batches(std::slice::from_ref(&ci), test_style(), |_| {
+            panic!("Kitty placeholders must not reach glyph atlas lookup")
+        });
+        assert!(batches.fg_instances.is_empty());
+
         let (_, foreground, _) = build_cell_instances(
             &ci,
             test_style(),
