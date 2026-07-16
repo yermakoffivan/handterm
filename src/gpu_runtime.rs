@@ -30,6 +30,10 @@ struct Uniforms {
 const ATLAS_WIDTH: u32 = 2048;
 const ATLAS_HEIGHT: u32 = 1024;
 
+fn atlas_dimensions_fit(width: u32, height: u32) -> bool {
+    width <= ATLAS_WIDTH && height <= ATLAS_HEIGHT
+}
+
 pub(crate) struct GpuGlyphEntry {
     x: u32,
     y: u32,
@@ -1360,6 +1364,10 @@ fn ensure_glyph_in_atlas<'a>(
         atlas.baseline,
     );
 
+    if !atlas_dimensions_fit(upload_width, upload_height) {
+        return None;
+    }
+
     if atlas_state.atlas_cursor_x + upload_width > ATLAS_WIDTH {
         atlas_state.atlas_cursor_x = 0;
         atlas_state.atlas_cursor_y += atlas_state.atlas_row_height;
@@ -1449,6 +1457,10 @@ fn ensure_grapheme_in_atlas<'a>(
         atlas.baseline,
     );
 
+    if !atlas_dimensions_fit(upload_width, upload_height) {
+        return None;
+    }
+
     if atlas_state.atlas_cursor_x + upload_width > ATLAS_WIDTH {
         atlas_state.atlas_cursor_x = 0;
         atlas_state.atlas_cursor_y += atlas_state.atlas_row_height;
@@ -1517,6 +1529,9 @@ fn ensure_kitty_image_in_atlas<'a>(
         return None;
     }
     if image.data.len() != (image.width as usize) * (image.height as usize) * 4 {
+        return None;
+    }
+    if !atlas_dimensions_fit(image.width, image.height) {
         return None;
     }
 

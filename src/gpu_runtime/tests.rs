@@ -637,6 +637,13 @@ fn gpu_glyph_tile_preserves_top_overhang() {
 }
 
 #[test]
+fn atlas_rejects_tiles_larger_than_the_texture_extent() {
+    assert!(atlas_dimensions_fit(ATLAS_WIDTH, ATLAS_HEIGHT));
+    assert!(!atlas_dimensions_fit(ATLAS_WIDTH + 1, 1));
+    assert!(!atlas_dimensions_fit(1, ATLAS_HEIGHT + 1));
+}
+
+#[test]
 fn prefers_non_srgb_surface_format_when_available() {
     let capabilities = wgpu::SurfaceCapabilities {
         formats: vec![
