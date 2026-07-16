@@ -6,6 +6,18 @@ pub struct KittyImage {
     pub data: Vec<u8>,
 }
 
+impl KittyImage {
+    pub fn has_valid_rgba_data(&self) -> bool {
+        if self.width == 0 || self.height == 0 {
+            return false;
+        }
+        (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            == Some(self.data.len())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct KittyPlacement {
     pub image_id: u32,
@@ -535,5 +547,17 @@ mod tests {
         messages.sort();
         messages.dedup();
         assert_eq!(messages.len(), variants.len(), "messages must be distinct");
+    }
+
+    #[test]
+    fn kitty_image_rgba_validation_rejects_overflowing_dimensions() {
+        let image = KittyImage {
+            id: 1,
+            width: u32::MAX,
+            height: u32::MAX,
+            data: vec![0; 4],
+        };
+
+        assert!(!image.has_valid_rgba_data());
     }
 }

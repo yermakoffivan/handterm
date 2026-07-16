@@ -246,6 +246,18 @@ fn image_instance_capacity_is_bounded_by_device_and_draw_limits() {
 }
 
 #[test]
+fn malformed_kitty_image_dimensions_are_rejected_before_upload() {
+    let image = KittyImage {
+        id: 1,
+        width: u32::MAX,
+        height: u32::MAX,
+        data: vec![0; 4],
+    };
+
+    assert!(!kitty_image_is_uploadable(&image));
+}
+
+#[test]
 fn image_cache_is_surface_scoped_and_reuses_fitting_updates() {
     let first_window = (1, 7);
     let second_window = (2, 7);

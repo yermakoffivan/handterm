@@ -647,10 +647,7 @@ fn draw_kitty_images(
         let Some(image) = terminal.kitty_image(placement.image_id) else {
             continue;
         };
-        if image.width == 0 || image.height == 0 {
-            continue;
-        }
-        if image.data.len() != (image.width as usize) * (image.height as usize) * 4 {
+        if !image.has_valid_rgba_data() {
             continue;
         }
 
@@ -695,10 +692,7 @@ fn draw_kitty_images(
         };
         let image_width = image.width as usize;
         let image_height = image.height as usize;
-        if image_width == 0
-            || image_height == 0
-            || image.data.len() != image_width.saturating_mul(image_height).saturating_mul(4)
-        {
+        if !image.has_valid_rgba_data() {
             continue;
         }
 
@@ -920,6 +914,43 @@ mod tests {
         assert!(
             renderer.pixels.contains(&0xff0000),
             "expected kitty image to draw a red pixel"
+        );
+    }
+
+    #[test]
+    fn malformed_kitty_image_dimensions_are_ignored_without_rendering() {
+        let config = AppConfig::default();
+        let cols = 2;
+        let rows = 1;
+        let mut atlas = new_atlas(&config);
+        let mut terminal = Terminal::new(cols, rows);
+        terminal.cursor_visible = false;
+        terminal.apply_server_message(&crate::protocol::ServerMessage::KittyImageState {
+            window_id: 1,
+            generation: 1,
+            images: vec![crate::protocol::KittyImageData {
+                id: 1,
+                width: u32::MAX,
+                height: u32::MAX,
+                data: vec![0; 4],
+            }],
+            placements: vec![crate::protocol::KittyImagePlacement {
+                image_id: 1,
+                col: 0,
+                row: 0,
+                cols: 1,
+                rows: 1,
+            }],
+        });
+        let mut renderer = OffscreenRenderer::new(cols, rows, &atlas);
+
+        renderer.render(&mut terminal, &mut atlas, &config);
+
+        assert!(
+            renderer
+                .pixels
+                .iter()
+                .all(|pixel| *pixel == config.style.background.as_u32_rgb())
         );
     }
 

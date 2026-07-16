@@ -10,6 +10,7 @@ use crate::gpu_frame::{
 use crate::kitty_placeholders::fill_kitty_virtual_cells;
 use crate::terminal::TerminalView;
 use anyhow::{Context, Result};
+use handterm_common::graphics::KittyImage;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -35,6 +36,10 @@ static NEXT_IMAGE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
 fn atlas_dimensions_fit(width: u32, height: u32) -> bool {
     width <= ATLAS_WIDTH && height <= ATLAS_HEIGHT
+}
+
+fn kitty_image_is_uploadable(image: &KittyImage) -> bool {
+    image.has_valid_rgba_data() && atlas_dimensions_fit(image.width, image.height)
 }
 
 fn image_instance_buffer_size(instance_capacity: usize) -> u64 {
@@ -1590,13 +1595,7 @@ fn ensure_kitty_image_in_atlas<'a>(
     let key = (image_namespace, image_id);
     let generation = terminal.kitty_generation();
     let image = terminal.kitty_image(image_id)?;
-    if image.width == 0 || image.height == 0 {
-        return None;
-    }
-    if image.data.len() != (image.width as usize) * (image.height as usize) * 4 {
-        return None;
-    }
-    if !atlas_dimensions_fit(image.width, image.height) {
+    if !kitty_image_is_uploadable(image) {
         return None;
     }
 
