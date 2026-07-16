@@ -246,7 +246,7 @@ fn image_instance_capacity_is_bounded_by_device_and_draw_limits() {
 }
 
 #[test]
-fn image_cache_is_surface_scoped_and_reuses_same_size_updates() {
+fn image_cache_is_surface_scoped_and_reuses_fitting_updates() {
     let first_window = (1, 7);
     let second_window = (2, 7);
     assert_ne!(first_window, second_window);
@@ -256,13 +256,16 @@ fn image_cache_is_surface_scoped_and_reuses_same_size_updates() {
         y: 20,
         width: ATLAS_WIDTH,
         height: ATLAS_HEIGHT,
+        allocated_width: ATLAS_WIDTH,
+        allocated_height: ATLAS_HEIGHT,
         generation: 1,
     };
     assert!(image_entry_can_reuse(&entry, ATLAS_WIDTH, ATLAS_HEIGHT));
+    assert!(image_entry_can_reuse(&entry, ATLAS_WIDTH - 1, ATLAS_HEIGHT));
     assert!(!image_entry_can_reuse(
         &entry,
-        ATLAS_WIDTH - 1,
-        ATLAS_HEIGHT
+        ATLAS_WIDTH,
+        ATLAS_HEIGHT + 1
     ));
 }
 

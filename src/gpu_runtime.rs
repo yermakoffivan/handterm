@@ -79,11 +79,13 @@ pub(crate) struct GpuImageEntry {
     y: u32,
     width: u32,
     height: u32,
+    allocated_width: u32,
+    allocated_height: u32,
     generation: u64,
 }
 
 fn image_entry_can_reuse(entry: &GpuImageEntry, width: u32, height: u32) -> bool {
-    entry.width == width && entry.height == height
+    width <= entry.allocated_width && height <= entry.allocated_height
 }
 
 pub struct SharedAtlasState {
@@ -1622,11 +1624,13 @@ fn ensure_kitty_image_in_atlas<'a>(
                     depth_or_array_layers: 1,
                 },
             );
-            atlas_state
+            let entry = atlas_state
                 .image_map
                 .get_mut(&key)
-                .expect("reusable image cache entry disappeared")
-                .generation = generation;
+                .expect("reusable image cache entry disappeared");
+            entry.width = image.width;
+            entry.height = image.height;
+            entry.generation = generation;
             return atlas_state.image_map.get(&key);
         }
     }
@@ -1670,6 +1674,8 @@ fn ensure_kitty_image_in_atlas<'a>(
         y: atlas_state.atlas_cursor_y,
         width: image.width,
         height: image.height,
+        allocated_width: image.width,
+        allocated_height: image.height,
         generation,
     };
     atlas_state.atlas_cursor_x += image.width + 1;
