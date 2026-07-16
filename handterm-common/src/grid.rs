@@ -219,6 +219,10 @@ pub struct Grid {
     scrollback_len: usize,
     scrollback_head: usize,
     scrollback_max: usize,
+    /// Total number of full-screen rows shifted into (or past) scrollback.
+    /// Unlike `scrollback_len`, this keeps increasing after the ring fills so
+    /// objects anchored to historical rows retain a stable coordinate.
+    history_rows: u64,
     pub scroll_offset: usize,
     pub selection: Option<Selection>,
 }
@@ -277,6 +281,7 @@ impl Grid {
             scrollback_len: 0,
             scrollback_head: 0,
             scrollback_max,
+            history_rows: 0,
             scroll_offset: 0,
             selection: None,
         }
@@ -539,6 +544,10 @@ impl Grid {
 
     pub fn scrollback_len(&self) -> usize {
         self.scrollback_len
+    }
+
+    pub fn history_rows(&self) -> u64 {
+        self.history_rows
     }
 
     /// Number of cells currently backed by the lazily-allocated scrollback
@@ -861,6 +870,7 @@ impl Grid {
             self.graphemes[blank_start..blank_start + cols].fill(None);
         }
         self.top_row = (old_top + 1) % self.rows;
+        self.history_rows = self.history_rows.saturating_add(1);
         self.all_dirty = true;
     }
 
@@ -1349,6 +1359,7 @@ impl Grid {
                 self.graphemes[blank_start..blank_start + cols].fill(None);
             }
             self.top_row = (self.top_row + 1) % self.rows;
+            self.history_rows = self.history_rows.saturating_add(1);
         } else {
             let cols = self.cols;
             let has_graphemes = self.has_graphemes;

@@ -46,6 +46,7 @@ pub mod visual;
 pub mod workloads;
 
 pub use handterm_common::grid;
+pub use handterm_common::kitty_placeholders;
 pub use handterm_common::parser;
 pub use handterm_common::protocol;
 pub use handterm_common::server_sync;

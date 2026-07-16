@@ -279,6 +279,53 @@ pub struct FrameDecision {
     pub wait_until: Option<Instant>,
 }
 
+/// DEC synchronized updates should normally end quickly, but a misbehaving or
+/// terminated child must not be able to freeze a window forever.
+pub const SYNCHRONIZED_UPDATE_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SynchronizedUpdateAction {
+    /// Keep the previously presented frame while the child is still updating.
+    Hold,
+    /// The update just ended, so the completed frame should be presented now.
+    Release,
+    /// No synchronized update is involved; use ordinary frame scheduling.
+    Pass,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SynchronizedUpdateGate {
+    active_since: Option<Instant>,
+}
+
+impl SynchronizedUpdateGate {
+    pub fn observe(&mut self, active: bool, now: Instant) -> SynchronizedUpdateAction {
+        if active {
+            self.active_since.get_or_insert(now);
+            return SynchronizedUpdateAction::Hold;
+        }
+
+        if self.active_since.take().is_some() {
+            SynchronizedUpdateAction::Release
+        } else {
+            SynchronizedUpdateAction::Pass
+        }
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.active_since
+            .map(|started| started + SYNCHRONIZED_UPDATE_TIMEOUT)
+    }
+
+    pub fn expire(&mut self, now: Instant) -> bool {
+        let expired = self.deadline().is_some_and(|deadline| now >= deadline);
+        if expired {
+            self.active_since = None;
+        }
+        expired
+    }
+}
+
 impl FrameDecision {
     pub fn blocks_periodic_redraw(self) -> bool {
         self.wait_until.is_some()
@@ -363,12 +410,33 @@ impl ViewportScroll {
         }
     }
 
+    /// Resolve the displayed scroll position from the smooth-scroll value when
+    /// it is active, otherwise from the grid's integral history offset.
+    pub fn from_scroll_state(grid_scroll_offset: usize, smooth_scroll_rows: f32) -> Self {
+        let smooth_scroll_rows = smooth_scroll_rows.max(0.0);
+        if smooth_scroll_rows > 0.0 {
+            Self::from_scroll_rows(smooth_scroll_rows)
+        } else {
+            Self::from_scroll_rows(grid_scroll_offset as f32)
+        }
+    }
+
+    pub fn scroll_rows(self) -> f32 {
+        self.sample_offset as f32 - self.fractional_rows
+    }
+
     pub fn extra_visible_rows(self) -> usize {
         usize::from(self.fractional_rows > 0.0)
     }
 
     pub fn viewport_offset_y(self, cell_h: f32) -> f32 {
         -(self.fractional_rows * cell_h)
+    }
+
+    /// Translation for objects stored in live-grid coordinates rather than
+    /// reconstructed from sampled history rows.
+    pub fn live_grid_offset_y(self, cell_h: f32) -> f32 {
+        self.scroll_rows() * cell_h
     }
 
     pub fn visible_rows(self, base_rows: usize) -> usize {
@@ -1236,6 +1304,79 @@ mod tests {
     }
 
     #[test]
+    fn synchronized_update_gate_holds_then_releases_atomically() {
+        let start = Instant::now();
+        let mut gate = SynchronizedUpdateGate::default();
+
+        assert_eq!(gate.observe(true, start), SynchronizedUpdateAction::Hold);
+        assert_eq!(
+            gate.observe(true, start + Duration::from_millis(10)),
+            SynchronizedUpdateAction::Hold
+        );
+        assert_eq!(
+            gate.observe(false, start + Duration::from_millis(20)),
+            SynchronizedUpdateAction::Release
+        );
+        assert_eq!(
+            gate.observe(false, start + Duration::from_millis(21)),
+            SynchronizedUpdateAction::Pass
+        );
+    }
+
+    #[test]
+    fn synchronized_update_gate_expires_stuck_child() {
+        let start = Instant::now();
+        let mut gate = SynchronizedUpdateGate::default();
+        assert_eq!(gate.observe(true, start), SynchronizedUpdateAction::Hold);
+        assert!(!gate.expire(start + SYNCHRONIZED_UPDATE_TIMEOUT - Duration::from_millis(1)));
+        assert!(gate.expire(start + SYNCHRONIZED_UPDATE_TIMEOUT));
+        assert_eq!(gate.deadline(), None);
+    }
+
+    #[test]
+    fn synchronized_update_activity_does_not_extend_timeout() {
+        let start = Instant::now();
+        let deadline = start + SYNCHRONIZED_UPDATE_TIMEOUT;
+        let mut gate = SynchronizedUpdateGate::default();
+
+        assert_eq!(gate.observe(true, start), SynchronizedUpdateAction::Hold);
+        assert_eq!(gate.deadline(), Some(deadline));
+        assert_eq!(
+            gate.observe(true, deadline - Duration::from_millis(1)),
+            SynchronizedUpdateAction::Hold
+        );
+        assert_eq!(gate.deadline(), Some(deadline));
+        assert!(gate.expire(deadline));
+    }
+
+    #[test]
+    fn synchronized_update_gate_can_reenter_after_timeout() {
+        let start = Instant::now();
+        let mut gate = SynchronizedUpdateGate::default();
+
+        assert_eq!(gate.observe(true, start), SynchronizedUpdateAction::Hold);
+        assert!(gate.expire(start + SYNCHRONIZED_UPDATE_TIMEOUT));
+        assert_eq!(
+            gate.observe(false, start + SYNCHRONIZED_UPDATE_TIMEOUT),
+            SynchronizedUpdateAction::Pass
+        );
+
+        let restarted = start + SYNCHRONIZED_UPDATE_TIMEOUT + Duration::from_millis(1);
+        assert_eq!(
+            gate.observe(true, restarted),
+            SynchronizedUpdateAction::Hold
+        );
+        assert_eq!(
+            gate.deadline(),
+            Some(restarted + SYNCHRONIZED_UPDATE_TIMEOUT)
+        );
+        assert_eq!(
+            gate.observe(false, restarted + Duration::from_millis(1)),
+            SynchronizedUpdateAction::Release
+        );
+    }
+
+    #[test]
     fn frame_scheduler_light_io_ready_redraws_immediately() {
         let mut scheduler = FrameScheduler::default();
         scheduler.mark_io_ready_light();
@@ -1259,6 +1400,17 @@ mod tests {
         assert_eq!(viewport.mouse_row_for_pixel_y(0.0, 16.0, 24), 0);
         assert_eq!(viewport.mouse_row_for_pixel_y(5.0, 16.0, 24), 1);
         assert_eq!(viewport.mouse_row_for_pixel_y(20.0, 16.0, 24), 2);
+    }
+
+    #[test]
+    fn viewport_scroll_uses_grid_history_when_smooth_value_is_inactive() {
+        let integral = ViewportScroll::from_scroll_state(3, 0.0);
+        assert_eq!(integral.sample_offset, 3);
+        assert_eq!(integral.scroll_rows(), 3.0);
+
+        let smooth = ViewportScroll::from_scroll_state(3, 1.25);
+        assert_eq!(smooth.sample_offset, 2);
+        assert_eq!(smooth.scroll_rows(), 1.25);
     }
 
     #[test]

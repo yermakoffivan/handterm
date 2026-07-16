@@ -3,6 +3,7 @@ use crate::config::AppConfig;
 use crate::font::GlyphAtlas;
 use crate::frontend::{VisualState, compute_scrollbar_geometry, sync_visual_damage};
 use crate::grid::{COLOR_DEFAULT, Cell};
+use crate::kitty_placeholders::{fill_kitty_virtual_cells, is_kitty_unicode_placeholder};
 use crate::terminal::{CursorStyle, TerminalView};
 use crate::visual::{is_in_selection, resolve_cell_colors, resolve_underline_color};
 
@@ -233,7 +234,8 @@ pub fn render_terminal_to_buffer(
                 let selected = is_in_selection(selection, row, col);
                 let colors = resolve_cell_colors(cell, base_fg, base_bg, is_cursor_block, selected);
                 let grapheme = grid.cell_grapheme_at_scroll(row, col);
-                let has_content = cell.ch > 0x20 || grapheme.is_some();
+                let is_image_placeholder = is_kitty_unicode_placeholder(cell.ch, grapheme);
+                let has_content = !is_image_placeholder && (cell.ch > 0x20 || grapheme.is_some());
 
                 let same_run = has_content
                     && grapheme.is_none()
@@ -248,7 +250,9 @@ pub fn render_terminal_to_buffer(
                     run_text.clear();
                 }
 
-                if let Some(grapheme) = grapheme {
+                if is_image_placeholder {
+                    // The image layer below the text owns this cell.
+                } else if let Some(grapheme) = grapheme {
                     atlas.draw_grapheme(buffer, buf_w, buf_h, col, row, grapheme, colors.fg);
                 } else if has_content {
                     if run_text.is_empty() {
@@ -280,7 +284,8 @@ pub fn render_terminal_to_buffer(
 
             for col in 0..grid.cols {
                 let cell = grid.cell_at_scroll(row, col);
-                if cell.attrs == 0 {
+                let grapheme = grid.cell_grapheme_at_scroll(row, col);
+                if cell.attrs == 0 || is_kitty_unicode_placeholder(cell.ch, grapheme) {
                     continue;
                 }
                 if !full_redraw && !row_redraw_all && !grid.is_cell_dirty(row, col) {
@@ -324,18 +329,21 @@ pub fn render_terminal_to_buffer(
                 }
 
                 let grapheme = grid.cell_grapheme_at_scroll(row, col);
-                let has_content = cell.ch > 0x20 || grapheme.is_some();
+                let is_image_placeholder = is_kitty_unicode_placeholder(cell.ch, grapheme);
+                let has_content = !is_image_placeholder && (cell.ch > 0x20 || grapheme.is_some());
                 let is_cursor_block = is_cursor && cursor_style == CursorStyle::Block;
                 let selected = is_in_selection(selection, row, col);
                 let colors = resolve_cell_colors(cell, base_fg, base_bg, is_cursor_block, selected);
 
-                if let Some(grapheme) = grapheme {
+                if is_image_placeholder {
+                    // The image layer below the text owns this cell.
+                } else if let Some(grapheme) = grapheme {
                     atlas.draw_grapheme(buffer, buf_w, buf_h, col, row, grapheme, colors.fg);
                 } else if has_content {
                     atlas.draw_glyph(buffer, buf_w, buf_h, col, row, cell.ch, colors.fg);
                 }
 
-                if cell.attrs != 0 {
+                if cell.attrs != 0 && !is_image_placeholder {
                     draw_text_decorations(
                         buffer,
                         (buf_w, buf_h),
@@ -617,6 +625,10 @@ fn draw_kitty_images(
     cell_w: usize,
     cell_h: usize,
 ) {
+    let grid = terminal.grid();
+    let viewport_top_row = grid
+        .history_rows()
+        .saturating_sub(grid.scroll_offset as u64);
     for placement in terminal.kitty_placements() {
         let Some(image) = terminal.kitty_image(placement.image_id) else {
             continue;
@@ -629,26 +641,76 @@ fn draw_kitty_images(
         }
 
         let px_x = placement.col * cell_w;
-        let px_y = placement.row * cell_h;
+        let relative_row = i128::from(placement.row) - i128::from(viewport_top_row);
+        let px_y = relative_row.saturating_mul(cell_h as i128);
         let px_w = placement.cols.max(1) * cell_w;
         let px_h = placement.rows.max(1) * cell_h;
+        let clipped_top = if px_y < 0 {
+            usize::try_from((-px_y).min(px_h as i128)).unwrap_or(px_h)
+        } else {
+            0
+        };
+        let dst_y = usize::try_from(px_y.max(0)).unwrap_or(usize::MAX);
         let draw_w = px_w.min(buf_w.saturating_sub(px_x));
-        let draw_h = px_h.min(buf_h.saturating_sub(px_y));
+        let draw_h = px_h
+            .saturating_sub(clipped_top)
+            .min(buf_h.saturating_sub(dst_y));
 
         if draw_w == 0 || draw_h == 0 {
             continue;
         }
 
         for dy in 0..draw_h {
-            let src_y = dy * image.height as usize / px_h.max(1);
-            let dst_y = px_y + dy;
-            let row_start = dst_y * buf_w;
+            let src_y = (clipped_top + dy) * image.height as usize / px_h.max(1);
+            let row_start = (dst_y + dy) * buf_w;
 
             for dx in 0..draw_w {
                 let src_x = dx * image.width as usize / px_w.max(1);
                 let src_offset = (src_y * image.width as usize + src_x) * 4;
                 let pixel = &mut buffer[row_start + px_x + dx];
                 blend_rgba(pixel, &image.data[src_offset..src_offset + 4]);
+            }
+        }
+    }
+
+    let mut virtual_cells = Vec::new();
+    fill_kitty_virtual_cells(grid, grid.scroll_offset, grid.rows, &mut virtual_cells);
+    for virtual_cell in virtual_cells {
+        let Some(image) = terminal.kitty_image(virtual_cell.image_id) else {
+            continue;
+        };
+        let image_width = image.width as usize;
+        let image_height = image.height as usize;
+        if image_width == 0
+            || image_height == 0
+            || image.data.len() != image_width.saturating_mul(image_height).saturating_mul(4)
+        {
+            continue;
+        }
+
+        let src_x = virtual_cell.image_col.saturating_mul(cell_w);
+        let src_y = virtual_cell.image_row.saturating_mul(cell_h);
+        if src_x >= image_width || src_y >= image_height {
+            continue;
+        }
+        let dst_x = virtual_cell.col.saturating_mul(cell_w);
+        let dst_y = virtual_cell.row.saturating_mul(cell_h);
+        let draw_w = cell_w
+            .min(image_width - src_x)
+            .min(buf_w.saturating_sub(dst_x));
+        let draw_h = cell_h
+            .min(image_height - src_y)
+            .min(buf_h.saturating_sub(dst_y));
+
+        for dy in 0..draw_h {
+            let source_row = (src_y + dy) * image_width;
+            let destination_row = (dst_y + dy) * buf_w;
+            for dx in 0..draw_w {
+                let source_offset = (source_row + src_x + dx) * 4;
+                blend_rgba(
+                    &mut buffer[destination_row + dst_x + dx],
+                    &image.data[source_offset..source_offset + 4],
+                );
             }
         }
     }
@@ -844,6 +906,145 @@ mod tests {
         assert!(
             renderer.pixels.contains(&0xff0000),
             "expected kitty image to draw a red pixel"
+        );
+    }
+
+    #[test]
+    fn kitty_image_tracks_live_grid_when_viewport_is_scrolled() {
+        let config = AppConfig::default();
+        let cols = 4;
+        let rows = 2;
+        let mut atlas = new_atlas(&config);
+        let mut terminal = Terminal::new_with_scrollback(cols, rows, 8);
+        terminal.cursor_visible = false;
+        let mut renderer = OffscreenRenderer::new(cols, rows, &atlas);
+
+        terminal.process(b"a\r\nb\r\nc");
+        assert!(terminal.grid.scrollback_len() >= 1);
+        terminal.process(b"\x1b[1;2H\x1b_Ga=T,i=5,f=32,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\");
+        terminal.grid.scroll_offset = 1;
+
+        renderer.render(&mut terminal, &mut atlas, &config);
+
+        let sample_x = atlas.cell_width + atlas.cell_width / 2;
+        let top_row_sample = (atlas.cell_height / 2) * renderer.width + sample_x;
+        let live_row_sample =
+            (atlas.cell_height + atlas.cell_height / 2) * renderer.width + sample_x;
+        assert_eq!(
+            renderer.pixels[top_row_sample],
+            config.style.background.as_u32_rgb(),
+            "the history row must not contain an image anchored to live-grid row zero"
+        );
+        assert_eq!(
+            renderer.pixels[live_row_sample], 0xff0000,
+            "the live-grid image must move down by the viewport scroll offset"
+        );
+    }
+
+    #[test]
+    fn ordinary_kitty_image_follows_output_into_scrollback() {
+        let config = AppConfig::default();
+        let cols = 4;
+        let rows = 2;
+        let mut atlas = new_atlas(&config);
+        let mut terminal = Terminal::new_with_scrollback(cols, rows, 8);
+        terminal.cursor_visible = false;
+        let mut renderer = OffscreenRenderer::new(cols, rows, &atlas);
+
+        terminal.process(b"\x1b[2;1H\x1b_Ga=T,i=5,f=32,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\");
+        assert_eq!(terminal.kitty_placements[0].row, 1);
+        terminal.process(b"\n");
+        assert_eq!(terminal.grid.history_rows(), 1);
+
+        renderer.render(&mut terminal, &mut atlas, &config);
+        let sample_x = atlas.cell_width / 2;
+        let top_sample = (atlas.cell_height / 2) * renderer.width + sample_x;
+        assert_eq!(
+            renderer.pixels[top_sample], 0xff0000,
+            "output scrolling must move the ordinary image from live row one to row zero"
+        );
+
+        terminal.grid.scroll_offset = 1;
+        renderer.reset();
+        renderer.render(&mut terminal, &mut atlas, &config);
+        let bottom_sample = (atlas.cell_height + atlas.cell_height / 2) * renderer.width + sample_x;
+        assert_eq!(renderer.pixels[bottom_sample], 0xff0000);
+        assert_eq!(
+            renderer.pixels[top_sample],
+            config.style.background.as_u32_rgb(),
+            "scrolling back must restore the image to its original historical row"
+        );
+    }
+
+    #[test]
+    fn ordinary_kitty_image_clips_source_after_scrolling_above_viewport() {
+        let config = AppConfig::default();
+        let cols = 2;
+        let rows = 2;
+        let mut atlas = new_atlas(&config);
+        let mut terminal = Terminal::new_with_scrollback(cols, rows, 8);
+        terminal.cursor_visible = false;
+        let mut renderer = OffscreenRenderer::new(cols, rows, &atlas);
+
+        terminal.process(b"\x1b[2;1H\x1b_Ga=T,i=5,f=32,s=1,v=2,c=1,r=2;/wAA/wAA//8=\x1b\\");
+        terminal.process(b"\n\n");
+        assert_eq!(terminal.grid.history_rows(), 2);
+
+        renderer.render(&mut terminal, &mut atlas, &config);
+        let top_sample = (atlas.cell_height / 2) * renderer.width + atlas.cell_width / 2;
+        assert_eq!(
+            renderer.pixels[top_sample], 0x0000ff,
+            "the visible half must sample the image's blue second source row"
+        );
+    }
+
+    #[test]
+    fn kitty_virtual_placeholder_renders_image_instead_of_fallback_glyph() {
+        let config = AppConfig::default();
+        let cols = 4;
+        let rows = 2;
+        let mut atlas = new_atlas(&config);
+        let mut terminal = Terminal::new(cols, rows);
+        terminal.cursor_visible = false;
+        let mut renderer = OffscreenRenderer::new(cols, rows, &atlas);
+
+        let stream = concat!(
+            "\x1b_Gq=2,i=5,a=T,U=1,f=32,t=d,s=1,v=1,m=0;/wAA/w==\x1b\\",
+            "\x1b[38;2;0;0;5m",
+            "\u{10eeee}\u{0305}\u{0305}\u{0305}",
+            "\x1b[0m"
+        );
+        terminal.process(stream.as_bytes());
+        assert!(terminal.kitty_placements.is_empty());
+
+        renderer.render(&mut terminal, &mut atlas, &config);
+
+        assert_eq!(renderer.pixels[0], 0xff0000);
+    }
+
+    #[test]
+    fn kitty_virtual_placeholder_ignores_reserved_text_decorations() {
+        let config = AppConfig::default();
+        let cols = 2;
+        let rows = 1;
+        let mut atlas = new_atlas(&config);
+        let mut terminal = Terminal::new(cols, rows);
+        terminal.cursor_visible = false;
+        let mut renderer = OffscreenRenderer::new(cols, rows, &atlas);
+
+        let stream = concat!(
+            "\x1b_Gq=2,i=5,a=T,U=1,f=32,t=d,s=1,v=1,m=0;/wAA/w==\x1b\\",
+            "\x1b[38;2;0;0;5;58;2;0;0;7m\x1b[4m",
+            "\u{10eeee}\u{0305}\u{0305}\u{0305}",
+            "\x1b[0m"
+        );
+        terminal.process(stream.as_bytes());
+        renderer.render(&mut terminal, &mut atlas, &config);
+
+        assert_eq!(renderer.pixels[0], 0xff0000);
+        assert!(
+            !renderer.pixels.contains(&0x000007),
+            "underline color encodes placement metadata and must not be painted"
         );
     }
 

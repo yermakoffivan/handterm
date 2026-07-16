@@ -3,10 +3,11 @@ use crate::font::{GlyphAtlas, GlyphFormat};
 use crate::frontend::{ViewportScroll, VisualState, visual_signature};
 use crate::gpu_frame::{
     AtlasImageRect, CellInfo, CellInstance, FrameBatchStyle, FrameTextBatches, GlyphAtlasEntry,
-    ImageInstance, append_scrollbar_overlay_instances, fill_cell_infos,
-    fill_cell_infos_with_scroll, fill_image_instances, fill_image_instances_with_viewport_offset,
+    ImageInstance, append_scrollbar_overlay_instances, append_virtual_image_instances,
+    fill_cell_infos, fill_cell_infos_with_scroll, fill_image_instances_with_history,
     fill_text_batches,
 };
+use crate::kitty_placeholders::fill_kitty_virtual_cells;
 use crate::terminal::TerminalView;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -32,6 +33,13 @@ const ATLAS_HEIGHT: u32 = 1024;
 
 fn atlas_dimensions_fit(width: u32, height: u32) -> bool {
     width <= ATLAS_WIDTH && height <= ATLAS_HEIGHT
+}
+
+fn image_instance_buffer_size(instance_capacity: usize) -> u64 {
+    u64::try_from(instance_capacity)
+        .ok()
+        .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<ImageInstance>() as u64))
+        .expect("image instance buffer size overflow")
 }
 
 pub(crate) struct GpuGlyphEntry {
@@ -779,7 +787,7 @@ pub fn create_surface_state_for_window_with_shared_profiled_with_defaults(
     let max_image_instances = (config.window.columns as usize) * (config.window.rows as usize);
     let image_instance_buffer = shared.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("image_instances"),
-        size: (max_image_instances * std::mem::size_of::<ImageInstance>()) as u64,
+        size: image_instance_buffer_size(max_image_instances),
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -913,7 +921,7 @@ pub fn resize_surface_state(
         state.max_image_instances = needed_images;
         state.image_instance_buffer = state.shared.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("image_instances"),
-            size: (needed_images * std::mem::size_of::<ImageInstance>()) as u64,
+            size: image_instance_buffer_size(needed_images),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -979,8 +987,10 @@ pub fn render_surface_state_profiled_with_scroll(
     let total_start = Instant::now();
     let current_visual = VisualState::capture(terminal);
     let signature = visual_signature(terminal);
-    let viewport_scroll = ViewportScroll::from_scroll_rows(scroll_rows);
-    let viewport_quantized = (scroll_rows.max(0.0) * 1024.0).round() as u32;
+    let viewport_scroll =
+        ViewportScroll::from_scroll_state(terminal.grid().scroll_offset, scroll_rows);
+    let effective_scroll_rows = viewport_scroll.scroll_rows();
+    let viewport_quantized = (effective_scroll_rows * 1024.0).round() as u32;
     if state.last_presented_signature == Some(signature)
         && state.last_viewport_scroll_quantized == Some(viewport_quantized)
     {
@@ -1096,55 +1106,72 @@ pub fn render_surface_state_profiled_with_scroll(
             state.surface_config.height as f32,
             terminal.grid().scrollback_len(),
             terminal.grid().rows,
-            scroll_rows,
+            effective_scroll_rows,
         );
     }
 
     let image_placements = terminal.kitty_placements().to_vec();
     let mut image_instances = std::mem::take(&mut state.image_instances);
-    if viewport_scroll == ViewportScroll::ZERO {
-        fill_image_instances(
-            &image_placements,
-            cell_w,
-            cell_h,
-            &mut image_instances,
-            |placement| {
-                ensure_kitty_image_in_atlas(
-                    &mut atlas_state,
-                    &state.shared.queue,
-                    terminal,
-                    placement.image_id,
-                )
-                .map(|entry| AtlasImageRect {
-                    x: entry.x,
-                    y: entry.y,
-                    width: entry.width,
-                    height: entry.height,
-                })
-            },
-        );
-    } else {
-        fill_image_instances_with_viewport_offset(
-            &image_placements,
-            cell_w,
-            cell_h,
-            viewport_scroll.viewport_offset_y(cell_h),
-            &mut image_instances,
-            |placement| {
-                ensure_kitty_image_in_atlas(
-                    &mut atlas_state,
-                    &state.shared.queue,
-                    terminal,
-                    placement.image_id,
-                )
-                .map(|entry| AtlasImageRect {
-                    x: entry.x,
-                    y: entry.y,
-                    width: entry.width,
-                    height: entry.height,
-                })
-            },
-        );
+    fill_image_instances_with_history(
+        &image_placements,
+        cell_w,
+        cell_h,
+        terminal.grid().history_rows(),
+        viewport_scroll,
+        &mut image_instances,
+        |placement| {
+            ensure_kitty_image_in_atlas(
+                &mut atlas_state,
+                &state.shared.queue,
+                terminal,
+                placement.image_id,
+            )
+            .map(|entry| AtlasImageRect {
+                x: entry.x,
+                y: entry.y,
+                width: entry.width,
+                height: entry.height,
+            })
+        },
+    );
+
+    let mut virtual_cells = Vec::new();
+    fill_kitty_virtual_cells(
+        terminal.grid(),
+        viewport_scroll.sample_offset,
+        terminal.grid().rows + viewport_scroll.extra_visible_rows(),
+        &mut virtual_cells,
+    );
+    append_virtual_image_instances(
+        &virtual_cells,
+        cell_w,
+        cell_h,
+        viewport_scroll.viewport_offset_y(cell_h),
+        &mut image_instances,
+        |virtual_cell| {
+            ensure_kitty_image_in_atlas(
+                &mut atlas_state,
+                &state.shared.queue,
+                terminal,
+                virtual_cell.image_id,
+            )
+            .map(|entry| AtlasImageRect {
+                x: entry.x,
+                y: entry.y,
+                width: entry.width,
+                height: entry.height,
+            })
+        },
+    );
+
+    if image_instances.len() > state.max_image_instances {
+        state.max_image_instances = image_instances.len().next_power_of_two();
+        state.image_instance_buffer = state.shared.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image_instances"),
+            size: image_instance_buffer_size(state.max_image_instances),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
     }
     drop(atlas_state);
 

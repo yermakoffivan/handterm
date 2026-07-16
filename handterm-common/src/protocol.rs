@@ -115,7 +115,7 @@ pub struct KittyImageData {
 pub struct KittyImagePlacement {
     pub image_id: u32,
     pub col: u16,
-    pub row: u16,
+    pub row: u64,
     pub cols: u16,
     pub rows: u16,
 }
@@ -801,7 +801,7 @@ pub fn encode_server_message(message: &ServerMessage) -> Result<Vec<u8>> {
             placements,
         } => {
             let images_bytes: usize = images.iter().map(|i| i.data.len() + 18).sum();
-            let mut buf = Vec::with_capacity(20 + images_bytes + placements.len() * 12);
+            let mut buf = Vec::with_capacity(20 + images_bytes + placements.len() * 18);
             buf.push(8);
             put_u32(&mut buf, *window_id);
             put_u64(&mut buf, *generation);
@@ -816,7 +816,7 @@ pub fn encode_server_message(message: &ServerMessage) -> Result<Vec<u8>> {
             for placement in placements {
                 put_u32(&mut buf, placement.image_id);
                 put_u16(&mut buf, placement.col);
-                put_u16(&mut buf, placement.row);
+                put_u64(&mut buf, placement.row);
                 put_u16(&mut buf, placement.cols);
                 put_u16(&mut buf, placement.rows);
             }
@@ -907,7 +907,7 @@ pub fn decode_server_message(bytes: &[u8]) -> Result<ServerMessage> {
                 placements.push(KittyImagePlacement {
                     image_id: r.u32()?,
                     col: r.u16()?,
-                    row: r.u16()?,
+                    row: r.u64()?,
                     cols: r.u16()?,
                     rows: r.u16()?,
                 });
@@ -1307,7 +1307,13 @@ mod tests {
             window_id: 0,
             generation: u64::MAX,
             images: vec![],
-            placements: vec![],
+            placements: vec![KittyImagePlacement {
+                image_id: u32::MAX,
+                col: u16::MAX,
+                row: u64::MAX,
+                cols: u16::MAX,
+                rows: u16::MAX,
+            }],
         };
         let encoded = encode_server_message(&message).expect("encode");
         assert_eq!(decode_server_message(&encoded).expect("decode"), message);

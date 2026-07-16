@@ -9,6 +9,7 @@ use crate::font::GlyphAtlas;
 use crate::gpu_frame::{
     FLAG_COLOR_GLYPH, FLAG_CURLY_UL, FLAG_CURSOR_BAR, FLAG_CURSOR_UNDERLINE, FLAG_DASHED_UL,
     FLAG_DOTTED_UL, FLAG_DOUBLE_UL, FLAG_HAS_GLYPH, FLAG_STRIKETHROUGH, FLAG_UNDERLINE,
+    fill_image_instances, fill_image_instances_with_viewport_offset,
 };
 use crate::render::OffscreenRenderer;
 use crate::terminal::Terminal;
@@ -218,6 +219,43 @@ fn draw_image_instances(
     }
 }
 
+#[test]
+fn image_instance_buffer_size_uses_u64_arithmetic_for_max_grid() {
+    let max_grid_instances = usize::from(u16::MAX) * usize::from(u16::MAX);
+    assert_eq!(
+        image_instance_buffer_size(max_grid_instances),
+        137_434_759_200
+    );
+}
+
+#[test]
+fn image_quad_destination_clipping_preserves_source_offset() {
+    let mut pixels = Vec::new();
+    for index in 1..=16u8 {
+        pixels.extend_from_slice(&[index, 0, 0, 0xff]);
+    }
+    let textures = std::collections::HashMap::from([(
+        (10, 20, 4, 4),
+        TestAtlasTexture {
+            pixels,
+            width: 4,
+            height: 4,
+        },
+    )]);
+    let instance = ImageInstance {
+        pos: [-2.0, -1.0],
+        size: [4.0, 4.0],
+        uv_offset: [10.0, 20.0],
+        uv_size: [4.0, 4.0],
+    };
+    let mut buffer = vec![0; 2 * 3];
+
+    draw_image_instances(&mut buffer, 2, 3, &[instance], &textures);
+
+    assert_eq!(sample_rgb(&buffer, 2, 0, 0), 0x07_0000);
+    assert_eq!(sample_rgb(&buffer, 2, 1, 2), 0x10_0000);
+}
+
 fn render_like_gpu_with_scroll(
     terminal: &mut Terminal,
     atlas: &mut GlyphAtlas,
@@ -230,8 +268,9 @@ fn render_like_gpu_with_scroll(
     let base_fg = config.style.foreground.as_u32_rgb();
     let mut buffer = vec![base_bg; width * height];
 
-    let effective_scroll_rows = terminal.grid().scroll_offset as f32 + scroll_rows.max(0.0);
-    let viewport_scroll = ViewportScroll::from_scroll_rows(effective_scroll_rows);
+    let viewport_scroll =
+        ViewportScroll::from_scroll_state(terminal.grid().scroll_offset, scroll_rows);
+    let effective_scroll_rows = viewport_scroll.scroll_rows();
 
     let mut cell_infos = Vec::new();
     if viewport_scroll == ViewportScroll::ZERO {
@@ -346,7 +385,7 @@ fn render_like_gpu_with_scroll(
             terminal.kitty_placements(),
             atlas.cell_width as f32,
             atlas.cell_height as f32,
-            viewport_scroll.viewport_offset_y(atlas.cell_height as f32),
+            viewport_scroll.live_grid_offset_y(atlas.cell_height as f32),
             &mut image_instances,
             |placement| {
                 let image = terminal.kitty_image(placement.image_id)?;

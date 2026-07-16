@@ -3,8 +3,9 @@ use crate::fd_watcher::spawn_fd_watcher;
 use crate::font::{GlyphAtlas, bootstrap_font_metrics_with_family_dpi};
 use crate::frontend::{
     FrameDecision, FrameScheduler, KeyEventKind, RecentTextKeyEvent, RedrawWork, StartupTiming,
-    VisualState, base64_decode, classify_redraw_work, key_to_bytes, remember_text_key_event,
-    scroll_to_bytes, scrollback_wheel_delta, should_skip_duplicate_ime_input,
+    SynchronizedUpdateAction, SynchronizedUpdateGate, VisualState, base64_decode,
+    classify_redraw_work, key_to_bytes, remember_text_key_event, scroll_to_bytes,
+    scrollback_wheel_delta, should_skip_duplicate_ime_input,
     should_skip_ime_commit_after_key_event, visual_signature,
 };
 use crate::host_commands::{
@@ -15,7 +16,7 @@ use crate::host_input::{
     SyntheticInputTarget, apply_synthetic_ime_commit, apply_synthetic_key_event,
 };
 use crate::ipc::{IpcAction, IpcServer, Request, Response};
-use crate::native_scroll::NativeScrollBridge;
+use crate::native_scroll::{NativeScrollBridge, child_process_envs};
 use crate::platform::{copy_to_clipboard, open_url, paste_from_clipboard};
 use crate::profiling::{ProcessCpuTime, emit_structured_profile_event};
 use crate::pty::PtyChild;
@@ -115,6 +116,7 @@ struct HostWindowState {
     last_visual_state: Option<VisualState>,
     last_presented_signature: Option<u64>,
     scheduler: FrameScheduler,
+    synchronized_update: SynchronizedUpdateGate,
     watcher_stop: Arc<AtomicBool>,
     cpu_time_started: Option<ProcessCpuTime>,
     startup_timing: StartupTiming,
@@ -397,15 +399,11 @@ impl HandtermApp {
         let id = self.next_window_id;
         self.next_window_id += 1;
         let native_scroll = NativeScrollBridge::new(id).ok();
-        let native_scroll_envs = native_scroll.as_ref().map(|bridge| bridge.child_envs(id));
+        let native_scroll_envs = child_process_envs(native_scroll.as_ref(), id);
         let native_scroll_env_refs = native_scroll_envs
-            .as_ref()
-            .map(|envs| {
-                envs.iter()
-                    .map(|(key, value)| (*key, value.as_str()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect::<Vec<_>>();
         let before_pty = Instant::now();
         let added_window_cwd = (existing_windows > 0).then(dirs::home_dir).flatten();
         let pty = PtyChild::spawn_default_shell_with_command_env_and_cwd(
@@ -461,6 +459,7 @@ impl HandtermApp {
                 last_visual_state: None,
                 last_presented_signature: None,
                 scheduler: FrameScheduler::default(),
+                synchronized_update: SynchronizedUpdateGate::default(),
                 watcher_stop: stop,
                 cpu_time_started,
                 startup_timing: {
@@ -722,19 +721,25 @@ impl ApplicationHandler<AppEvent> for HandtermApp {
                     state.startup_timing.mark_pty_event(Instant::now());
                     let bytes_read = drain_pty(state);
                     if bytes_read > 0 {
-                        let work = classify_redraw_work(&state.terminal, true);
-                        // A full-screen TUI update commonly arrives as several PTY
-                        // reads. Presenting every partial read can expose an
-                        // intermediate frame, which looks like flicker while
-                        // scrolling. Keep light output immediate, but coalesce
-                        // heavy updates for one frame interval in focused windows
-                        // as well as background windows.
-                        let should_redraw_now =
-                            state
-                                .scheduler
-                                .mark_io_processed(Instant::now(), FRAME_INTERVAL, work);
-                        if should_redraw_now {
-                            state.window.request_redraw();
+                        let now = Instant::now();
+                        match state
+                            .synchronized_update
+                            .observe(state.terminal.synchronized_update_active(), now)
+                        {
+                            SynchronizedUpdateAction::Hold => {}
+                            SynchronizedUpdateAction::Release => {
+                                state.scheduler.mark_redraw_needed();
+                                state.window.request_redraw();
+                            }
+                            SynchronizedUpdateAction::Pass => {
+                                let work = classify_redraw_work(&state.terminal, true);
+                                // Non-synchronized full-screen updates can still
+                                // span several PTY reads, so retain the heuristic
+                                // coalescing fallback for older applications.
+                                if state.scheduler.mark_io_processed(now, FRAME_INTERVAL, work) {
+                                    state.window.request_redraw();
+                                }
+                            }
                         }
                     }
                     if state.pty_closed {
@@ -1121,6 +1126,10 @@ impl ApplicationHandler<AppEvent> for HandtermApp {
                         }
                     }
                     WindowEvent::RedrawRequested => {
+                        if state.terminal.synchronized_update_active() {
+                            let _ = state.synchronized_update.observe(true, Instant::now());
+                            return;
+                        }
                         let Some(atlas) = atlas_cache.get_mut(&state.dpi) else {
                             eprintln!(
                                 "handterm cpu host: no glyph atlas cached for dpi {}; skipping redraw",
@@ -1185,6 +1194,19 @@ impl ApplicationHandler<AppEvent> for HandtermApp {
         let mut closed_windows = Vec::new();
 
         for (winit_id, state) in &mut self.windows {
+            if state.terminal.synchronized_update_active() {
+                let _ = state.synchronized_update.observe(true, now);
+                if state.synchronized_update.expire(now) {
+                    state.terminal.finish_synchronized_update();
+                    state.scheduler.mark_redraw_needed();
+                    redraw_ids.push(*winit_id);
+                } else if let Some(deadline) = state.synchronized_update.deadline() {
+                    earliest_deadline = earlier_deadline(earliest_deadline, deadline);
+                }
+                if state.terminal.synchronized_update_active() {
+                    continue;
+                }
+            }
             let scheduler = &mut state.scheduler;
             let decision: FrameDecision =
                 scheduler.prepare_redraw(Instant::now(), RedrawWork::default);

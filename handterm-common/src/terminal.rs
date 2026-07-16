@@ -45,6 +45,7 @@ pub struct Terminal {
     mode_bracketed_paste: bool,
     mode_focus_events: bool,
     mode_alternate_scroll: bool,
+    mode_synchronized_update: bool,
     pub application_cursor_keys: bool,
     pub mouse_mode: MouseMode,
     pub mouse_encoding: MouseEncoding,
@@ -180,6 +181,7 @@ impl Terminal {
             mode_bracketed_paste: false,
             mode_focus_events: false,
             mode_alternate_scroll: false,
+            mode_synchronized_update: false,
             application_cursor_keys: false,
             mouse_mode: MouseMode::Off,
             mouse_encoding: MouseEncoding::X10,
@@ -203,6 +205,21 @@ impl Terminal {
 
     pub fn scrollback_limit(&self) -> usize {
         self.scrollback_limit
+    }
+
+    /// Whether DEC private mode 2026 is holding the current frame.
+    ///
+    /// Full-screen TUIs use this mode to bracket a batch of terminal mutations
+    /// that must be presented atomically. The host render loops consult this
+    /// flag so a PTY read split between the begin and end sequences cannot expose
+    /// an intermediate frame.
+    pub fn synchronized_update_active(&self) -> bool {
+        self.mode_synchronized_update
+    }
+
+    /// Release a synchronized update that exceeded the host safety timeout.
+    pub fn finish_synchronized_update(&mut self) {
+        self.mode_synchronized_update = false;
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -779,6 +796,7 @@ impl Terminal {
                             self.enter_alt_screen();
                         }
                         2004 => self.mode_bracketed_paste = true,
+                        2026 => self.mode_synchronized_update = true,
                         1004 => self.mode_focus_events = true,
                         1007 => self.mode_alternate_scroll = true,
                         9 => self.mouse_mode = MouseMode::X10,
@@ -806,6 +824,7 @@ impl Terminal {
                             self.restore_cursor();
                         }
                         2004 => self.mode_bracketed_paste = false,
+                        2026 => self.mode_synchronized_update = false,
                         1004 => self.mode_focus_events = false,
                         1007 => self.mode_alternate_scroll = false,
                         9 | 1000 | 1002 | 1003 => self.mouse_mode = MouseMode::Off,
@@ -1055,9 +1074,11 @@ impl Terminal {
             (data, &[][..])
         };
 
-        let mut action = 0u8;
+        let mut action = b't';
+        let mut action_specified = false;
         let mut img_id = 0u32;
         let mut fmt = 32u32;
+        let mut format_specified = false;
         let mut width = 0u32;
         let mut height = 0u32;
         let mut more = false;
@@ -1065,7 +1086,9 @@ impl Terminal {
         let mut rows_param = 0u32;
         let mut delete = None;
         let mut quiet = 0u8;
+        let mut quiet_specified = false;
         let mut compression = None;
+        let mut virtual_placement = false;
 
         for kv in control.split(|&b| b == b',') {
             if kv.len() < 3 || kv[1] != b'=' {
@@ -1083,17 +1106,27 @@ impl Terminal {
                 })
             };
             match key {
-                b'a' => action = val[0],
+                b'a' => {
+                    action = val[0];
+                    action_specified = true;
+                }
                 b'i' => img_id = val_num(),
-                b'f' => fmt = val_num(),
+                b'f' => {
+                    fmt = val_num();
+                    format_specified = true;
+                }
                 b's' => width = val_num(),
                 b'v' => height = val_num(),
                 b'm' => more = val_num() == 1,
                 b'c' => cols = val_num(),
                 b'r' => rows_param = val_num(),
                 b'd' => delete = val.first().copied(),
-                b'q' => quiet = val_num().min(u8::MAX as u32) as u8,
+                b'q' => {
+                    quiet = val_num().min(u8::MAX as u32) as u8;
+                    quiet_specified = true;
+                }
                 b'o' => compression = val.first().copied(),
+                b'U' => virtual_placement = val_num() == 1,
                 _ => {}
             }
         }
@@ -1104,66 +1137,65 @@ impl Terminal {
             quiet,
         };
 
+        if !action_specified && self.kitty_upload.more_chunks {
+            if quiet_specified {
+                self.kitty_upload.pending_quiet = quiet;
+            }
+            self.kitty_upload.payload_buf.extend_from_slice(payload);
+            if more {
+                return;
+            }
+
+            let full_payload = std::mem::take(&mut self.kitty_upload.payload_buf);
+            let request = KittyImageFinalize {
+                id: self.kitty_upload.pending_id,
+                compression: self.kitty_upload.pending_compression,
+                format: self.kitty_upload.pending_fmt,
+                width: self.kitty_upload.pending_width,
+                height: self.kitty_upload.pending_height,
+                action: self.kitty_upload.pending_action,
+                virtual_placement: self.kitty_upload.pending_virtual_placement,
+                cols: self.kitty_upload.pending_cols,
+                rows_param: self.kitty_upload.pending_rows,
+            };
+            let final_quiet = self.kitty_upload.pending_quiet;
+            self.abort_partial_kitty_upload();
+            self.finalize_kitty_image(request, &full_payload, final_quiet);
+            return;
+        }
+
+        if action_specified && self.kitty_upload.more_chunks {
+            self.abort_partial_kitty_upload();
+        }
+
         match action {
-            b't' | b'T' | 0 => {
-                if action == 0 && !self.kitty_upload.more_chunks && !more {
-                    return;
-                }
-                if self.kitty_upload.more_chunks || more {
+            b't' | b'T' => {
+                if more {
                     self.kitty_upload.payload_buf.extend_from_slice(payload);
-                    if img_id > 0 {
-                        self.kitty_upload.pending_id = img_id;
-                    }
-                    if fmt > 0 {
-                        self.kitty_upload.pending_fmt = fmt;
-                    }
-                    if width > 0 {
-                        self.kitty_upload.pending_width = width;
-                    }
-                    if height > 0 {
-                        self.kitty_upload.pending_height = height;
-                    }
-                    if compression.is_some() {
-                        self.kitty_upload.pending_compression = compression;
-                    }
-                    self.kitty_upload.more_chunks = more;
-                    if !more {
-                        let full_payload = std::mem::take(&mut self.kitty_upload.payload_buf);
-                        let final_id = self.kitty_upload.pending_id;
-                        let final_fmt = self.kitty_upload.pending_fmt;
-                        let final_w = self.kitty_upload.pending_width;
-                        let final_h = self.kitty_upload.pending_height;
-                        let final_compression = self.kitty_upload.pending_compression.take();
-                        self.kitty_upload.pending_id = 0;
-                        self.kitty_upload.pending_fmt = 0;
-                        self.kitty_upload.pending_width = 0;
-                        self.kitty_upload.pending_height = 0;
-                        let request = KittyImageFinalize {
-                            id: final_id,
-                            compression: final_compression,
-                            format: final_fmt,
-                            width: final_w,
-                            height: final_h,
-                            action,
-                            cols,
-                            rows_param,
-                        };
-                        let _ = final_fmt;
-                        self.finalize_kitty_image(request, &full_payload, command.quiet);
-                    }
+                    self.kitty_upload.pending_action = action;
+                    self.kitty_upload.pending_id = img_id;
+                    self.kitty_upload.pending_fmt = if format_specified { fmt } else { 32 };
+                    self.kitty_upload.pending_width = width;
+                    self.kitty_upload.pending_height = height;
+                    self.kitty_upload.pending_cols = cols;
+                    self.kitty_upload.pending_rows = rows_param;
+                    self.kitty_upload.pending_quiet = quiet;
+                    self.kitty_upload.pending_compression = compression;
+                    self.kitty_upload.pending_virtual_placement = virtual_placement;
+                    self.kitty_upload.more_chunks = true;
                     return;
                 }
                 let request = KittyImageFinalize {
                     id: img_id,
                     compression,
-                    format: fmt,
+                    format: if format_specified { fmt } else { 32 },
                     width,
                     height,
                     action,
+                    virtual_placement,
                     cols,
                     rows_param,
                 };
-                let _ = fmt;
                 self.finalize_kitty_image(request, payload, command.quiet);
             }
             b'p' => {
@@ -1172,7 +1204,7 @@ impl Terminal {
                     self.kitty_placements.push(KittyPlacement {
                         image_id: img_id,
                         col,
-                        row,
+                        row: self.grid.history_rows().saturating_add(row as u64),
                         cols: if cols > 0 { cols as usize } else { 1 },
                         rows: if rows_param > 0 {
                             rows_param as usize
@@ -1217,16 +1249,21 @@ impl Terminal {
     }
 
     fn finalize_kitty_image(&mut self, request: KittyImageFinalize, payload: &[u8], quiet: u8) {
-        let (actual_width, actual_height, decoded) = if let Ok(d) = decode_kitty_image_payload(
+        let (actual_width, actual_height, decoded) = match decode_kitty_image_payload(
             request.format,
             request.compression,
             payload,
             request.width,
             request.height,
         ) {
-            d
-        } else {
-            return;
+            Ok(decoded) => decoded,
+            Err(error) => {
+                if request.id > 0 && quiet < 2 {
+                    let response = format!("\x1b_Gi={};EINVAL:{}\x1b\\", request.id, error);
+                    self.response_buf.extend_from_slice(response.as_bytes());
+                }
+                return;
+            }
         };
 
         let actual_id = if request.id > 0 {
@@ -1246,12 +1283,12 @@ impl Terminal {
         self.kitty_images.retain(|i| i.id != actual_id);
         self.kitty_images.push(image);
 
-        if request.action == b'T' || request.action == 0 {
+        if (request.action == b'T' || request.action == 0) && !request.virtual_placement {
             let (col, row) = self.grid.cursor_pos();
             self.kitty_placements.push(KittyPlacement {
                 image_id: actual_id,
                 col,
-                row,
+                row: self.grid.history_rows().saturating_add(row as u64),
                 cols: if request.cols > 0 {
                     request.cols as usize
                 } else {
@@ -1292,11 +1329,16 @@ impl Terminal {
 
     fn abort_partial_kitty_upload(&mut self) {
         self.kitty_upload.payload_buf.clear();
+        self.kitty_upload.pending_action = 0;
         self.kitty_upload.pending_id = 0;
         self.kitty_upload.pending_fmt = 0;
         self.kitty_upload.pending_width = 0;
         self.kitty_upload.pending_height = 0;
+        self.kitty_upload.pending_cols = 0;
+        self.kitty_upload.pending_rows = 0;
+        self.kitty_upload.pending_quiet = 0;
         self.kitty_upload.pending_compression = None;
+        self.kitty_upload.pending_virtual_placement = false;
         self.kitty_upload.more_chunks = false;
     }
 
@@ -1580,6 +1622,31 @@ mod tests {
         assert!(!t.grid.autowrap);
         assert!(!t.application_cursor_keys);
         assert!(!t.bracketed_paste_mode());
+    }
+
+    #[test]
+    fn synchronized_update_mode_tracks_dec_private_mode_2026() {
+        let mut t = Terminal::new(16, 2);
+        assert!(!t.synchronized_update_active());
+
+        t.process(b"\x1b[?2026h");
+        assert!(t.synchronized_update_active());
+
+        // Input is parsed into the pending frame while presentation is held.
+        t.process(b"complete frame");
+        assert!(t.synchronized_update_active());
+
+        t.process(b"\x1b[?2026l");
+        assert!(!t.synchronized_update_active());
+    }
+
+    #[test]
+    fn synchronized_update_can_be_released_after_timeout() {
+        let mut t = Terminal::new(8, 2);
+        t.process(b"\x1b[?2026h");
+        assert!(t.synchronized_update_active());
+        t.finish_synchronized_update();
+        assert!(!t.synchronized_update_active());
     }
 
     #[test]
@@ -2244,6 +2311,16 @@ mod tests {
     }
 
     #[test]
+    fn kitty_virtual_upload_stores_image_without_ordinary_placement() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b_Ga=T,U=1,i=17,f=32,s=1,v=1;/wAA/w==\x1b\\");
+
+        let image = t.kitty_image(17).expect("virtual kitty image should exist");
+        assert_eq!(image.data, vec![0xff, 0x00, 0x00, 0xff]);
+        assert!(t.kitty_placements.is_empty());
+    }
+
+    #[test]
     fn kitty_graphics_chunked_upload_only_acks_once_on_completion() {
         let mut t = Terminal::new(8, 4);
         t.process(b"\x1b_Ga=T,i=9,f=32,s=1,v=1,c=1,r=1,m=1;/wAA\x1b\\");
@@ -2257,6 +2334,152 @@ mod tests {
             t.drain_responses().as_deref(),
             Some(&b"\x1b_Gi=9;OK\x1b\\"[..])
         );
+    }
+
+    #[test]
+    fn kitty_chunked_transmit_only_does_not_create_a_placement() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b_Ga=t,i=18,f=32,s=1,v=1,m=1;/wAA\x1b\\");
+        t.process(b"\x1b_Gm=0;/w==\x1b\\");
+
+        assert!(t.kitty_image(18).is_some());
+        assert!(t.kitty_placements.is_empty());
+    }
+
+    #[test]
+    fn kitty_continuation_ignores_non_chunk_control_fields() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b_Ga=t,i=20,f=32,s=1,v=1,m=1;/wAA\x1b\\");
+        t.process(b"\x1b_Gi=99,f=24,s=2,v=2,o=x,q=2,U=1,m=0;/w==\x1b\\");
+
+        let image = t
+            .kitty_image(20)
+            .expect("continuation metadata must not replace the initiating request");
+        assert_eq!(image.data, vec![0xff, 0x00, 0x00, 0xff]);
+        assert!(t.kitty_image(99).is_none());
+        assert!(t.kitty_placements.is_empty());
+        assert!(
+            t.drain_responses().is_none(),
+            "q=2 is the only continuation field besides m that must be honored"
+        );
+    }
+
+    #[test]
+    fn kitty_explicit_transfer_aborts_an_interleaved_partial_upload() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b_Ga=T,i=21,f=32,s=1,v=1,m=1;/wAA\x1b\\");
+        t.process(b"\x1b_Ga=T,i=22,f=32,s=1,v=1;AAD//w==\x1b\\");
+        t.process(b"\x1b_Gm=0;/w==\x1b\\");
+
+        assert!(t.kitty_image(21).is_none());
+        assert_eq!(
+            t.kitty_image(22)
+                .expect("the replacement transfer should complete independently")
+                .data,
+            vec![0x00, 0x00, 0xff, 0xff]
+        );
+        assert_eq!(t.kitty_placements.len(), 1);
+        assert_eq!(t.kitty_placements[0].image_id, 22);
+    }
+
+    #[test]
+    fn kitty_chunk_decode_error_clears_state_before_the_next_upload() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b_Ga=T,i=23,f=100,m=1;bm90\x1b\\");
+        t.process(b"\x1b_Gm=0;cG5n\x1b\\");
+        t.process(b"\x1b_Ga=T,i=24,f=32,s=1,v=1;AP8A/w==\x1b\\");
+
+        assert!(t.kitty_image(23).is_none());
+        assert_eq!(
+            t.kitty_image(24)
+                .expect("a failed chunked decode must not poison later transfers")
+                .data,
+            vec![0x00, 0xff, 0x00, 0xff]
+        );
+        assert_eq!(t.kitty_placements.len(), 1);
+        assert_eq!(t.kitty_placements[0].image_id, 24);
+        assert_eq!(
+            t.drain_responses().as_deref(),
+            Some(
+                &b"\x1b_Gi=23;EINVAL:invalid or unsupported PNG data\x1b\\\x1b_Gi=24;OK\x1b\\"[..]
+            )
+        );
+    }
+
+    #[test]
+    fn kitty_chunked_placement_uses_the_cursor_at_finalization() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b_Ga=T,i=25,f=32,s=1,v=1,m=1;/wAA\x1b\\");
+        t.process(b"\x1b[3;4H");
+        t.process(b"\x1b_Gm=0;/w==\x1b\\");
+
+        assert_eq!(t.kitty_placements.len(), 1);
+        assert_eq!(t.kitty_placements[0].image_id, 25);
+        assert_eq!(
+            (t.kitty_placements[0].col, t.kitty_placements[0].row),
+            (3, 2)
+        );
+    }
+
+    #[test]
+    fn kitty_chunked_virtual_flag_survives_continuation_commands() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b_Ga=T,U=1,i=19,f=32,s=1,v=1,m=1;/wAA\x1b\\");
+        t.process(b"\x1b_Gm=0;/w==\x1b\\");
+
+        assert!(t.kitty_image(19).is_some());
+        assert!(t.kitty_placements.is_empty());
+    }
+
+    #[test]
+    fn kitty_chunked_png_preserves_format_geometry_and_quiet_mode() {
+        fn base64_encode(input: &[u8]) -> String {
+            const TABLE: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+            for chunk in input.chunks(3) {
+                let b0 = chunk[0];
+                let b1 = *chunk.get(1).unwrap_or(&0);
+                let b2 = *chunk.get(2).unwrap_or(&0);
+                let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
+                out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+                out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+                out.push(if chunk.len() > 1 {
+                    TABLE[((n >> 6) & 0x3f) as usize] as char
+                } else {
+                    '='
+                });
+                out.push(if chunk.len() > 2 {
+                    TABLE[(n & 0x3f) as usize] as char
+                } else {
+                    '='
+                });
+            }
+            out
+        }
+
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header should encode");
+            writer
+                .write_image_data(&[0xff, 0x00, 0x00, 0xff])
+                .expect("png image should encode");
+        }
+        let encoded = base64_encode(&png_bytes);
+        let (first, second) = encoded.split_at(48);
+        let mut t = Terminal::new(8, 4);
+        t.process(format!("\x1b_Ga=T,f=100,c=3,r=2,q=2,m=1;{first}\x1b\\").as_bytes());
+        t.process(format!("\x1b_Gm=0;{second}\x1b\\").as_bytes());
+
+        let image = t.kitty_image(1).expect("chunked PNG should decode");
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!(t.kitty_placements.len(), 1);
+        assert_eq!(t.kitty_placements[0].cols, 3);
+        assert_eq!(t.kitty_placements[0].rows, 2);
+        assert!(t.drain_responses().is_none());
     }
 
     #[test]

@@ -6,11 +6,13 @@ pub struct KittyImage {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct KittyPlacement {
     pub image_id: u32,
     pub col: usize,
-    pub row: usize,
+    /// Absolute grid row at placement time. The live viewport starts at
+    /// `Grid::history_rows()`, while scrollback moves that origin upward.
+    pub row: u64,
     pub cols: usize,
     pub rows: usize,
 }
@@ -18,11 +20,16 @@ pub struct KittyPlacement {
 #[derive(Debug, Clone, Default)]
 pub struct KittyUploadState {
     pub payload_buf: Vec<u8>,
+    pub pending_action: u8,
     pub pending_id: u32,
     pub pending_fmt: u32,
     pub pending_width: u32,
     pub pending_height: u32,
+    pub pending_cols: u32,
+    pub pending_rows: u32,
+    pub pending_quiet: u8,
     pub pending_compression: Option<u8>,
+    pub pending_virtual_placement: bool,
     pub more_chunks: bool,
 }
 
@@ -34,6 +41,7 @@ pub struct KittyImageFinalize {
     pub width: u32,
     pub height: u32,
     pub action: u8,
+    pub virtual_placement: bool,
     pub cols: u32,
     pub rows_param: u32,
 }

@@ -161,6 +161,24 @@ impl NativeScrollBridge {
     }
 }
 
+/// Environment variables passed to a handterm child process.
+///
+/// Terminal identity is independent of the optional native-scroll bridge, so
+/// children still receive `TERM_PROGRAM=handterm` if socket setup fails.
+pub(crate) fn child_process_envs(
+    bridge: Option<&NativeScrollBridge>,
+    window_id: u64,
+) -> Vec<(&'static str, String)> {
+    let mut envs = vec![(ENV_TERM_PROGRAM, TERM_PROGRAM_VALUE.to_string())];
+    if let Some(bridge) = bridge {
+        envs.extend([
+            (ENV_SOCKET, bridge.socket_path.display().to_string()),
+            (ENV_WINDOW_ID, window_id.to_string()),
+        ]);
+    }
+    envs
+}
+
 /// Fold `delta_rows` into the running fractional `residual` and return the
 /// whole number of scroll steps to emit, leaving the sub-row remainder in
 /// `residual` (always in the open interval `(-1.0, 1.0)`).
@@ -233,6 +251,10 @@ fn bridge_thread(
             match listener.accept() {
                 Ok((accepted, _)) => {
                     let _ = accepted.set_nonblocking(true);
+                    read_buf.clear();
+                    if let Ok(mut current) = snapshot.lock() {
+                        current.panes.clear();
+                    }
                     connected.store(true, Ordering::Relaxed);
                     stream = Some(accepted);
                 }
@@ -246,6 +268,10 @@ fn bridge_thread(
                 if write_line(active, &message).is_err() {
                     connected.store(false, Ordering::Relaxed);
                     stream = None;
+                    read_buf.clear();
+                    if let Ok(mut current) = snapshot.lock() {
+                        current.panes.clear();
+                    }
                     break;
                 }
             }
@@ -264,6 +290,7 @@ fn bridge_thread(
                 Err(_) => {
                     connected.store(false, Ordering::Relaxed);
                     stream = None;
+                    read_buf.clear();
                     if let Ok(mut current) = snapshot.lock() {
                         current.panes.clear();
                     }
@@ -468,6 +495,31 @@ mod tests {
         assert!(!bridge.connected.load(Ordering::Relaxed));
         assert!(!bridge.send_scroll_delta(PaneKind::Chat, 1.0));
         assert_eq!(bridge.chat_residual, 0.0);
+    }
+
+    #[test]
+    fn child_process_envs_preserve_term_program_when_bridge_setup_fails() {
+        let window_id = 999_994;
+        let socket_path = socket_path_for_window(window_id);
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&socket_path);
+        std::fs::create_dir(&socket_path).expect("blocking socket directory should be created");
+
+        let bridge = NativeScrollBridge::new(window_id);
+        assert!(
+            bridge.is_err(),
+            "socket bind should fail when its path is a directory"
+        );
+
+        let envs = child_process_envs(bridge.as_ref().ok(), window_id);
+        assert!(
+            envs.iter()
+                .any(|(key, value)| { *key == ENV_TERM_PROGRAM && value == TERM_PROGRAM_VALUE })
+        );
+        assert!(!envs.iter().any(|(key, _)| *key == ENV_SOCKET));
+        assert!(!envs.iter().any(|(key, _)| *key == ENV_WINDOW_ID));
+
+        std::fs::remove_dir(&socket_path).expect("blocking socket directory should be removed");
     }
 
     #[test]

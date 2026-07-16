@@ -3,9 +3,9 @@ use crate::fd_watcher::spawn_fd_watcher;
 use crate::font::{GlyphAtlas, bootstrap_font_metrics_with_family_dpi};
 use crate::frontend::{
     FrameDecision, FrameScheduler, KeyEventKind, RecentTextKeyEvent, RedrawWork, SmoothScrollState,
-    StartupTiming, ViewportScroll, base64_decode, key_to_bytes, remember_text_key_event,
-    scroll_to_bytes, scrollback_wheel_delta, should_skip_duplicate_ime_input,
-    should_skip_ime_commit_after_key_event,
+    StartupTiming, SynchronizedUpdateAction, SynchronizedUpdateGate, ViewportScroll, base64_decode,
+    key_to_bytes, remember_text_key_event, scroll_to_bytes, scrollback_wheel_delta,
+    should_skip_duplicate_ime_input, should_skip_ime_commit_after_key_event,
 };
 use crate::gpu_runtime::{
     GpuSurfaceState, SharedGpuContext, SharedGpuInitProfile, create_shared_gpu_context_profiled,
@@ -21,7 +21,7 @@ use crate::host_input::{
     SyntheticInputTarget, apply_synthetic_ime_commit, apply_synthetic_key_event,
 };
 use crate::ipc::{IpcAction, IpcServer, Request, Response};
-use crate::native_scroll::NativeScrollBridge;
+use crate::native_scroll::{NativeScrollBridge, child_process_envs};
 use crate::platform::{copy_to_clipboard, open_url, paste_from_clipboard};
 use crate::profiling::{ProcessCpuTime, emit_structured_profile_event};
 use crate::pty::PtyChild;
@@ -143,6 +143,7 @@ struct GpuWindowState {
     mouse_row: usize,
     selecting: bool,
     scheduler: FrameScheduler,
+    synchronized_update: SynchronizedUpdateGate,
     watcher_stop: Arc<AtomicBool>,
     open_window_start: Option<Instant>,
     cpu_time_started: Option<ProcessCpuTime>,
@@ -502,15 +503,11 @@ impl GpuApp {
         let id = self.next_window_id;
         self.next_window_id += 1;
         let native_scroll = NativeScrollBridge::new(id).ok();
-        let native_scroll_envs = native_scroll.as_ref().map(|bridge| bridge.child_envs(id));
+        let native_scroll_envs = child_process_envs(native_scroll.as_ref(), id);
         let native_scroll_env_refs = native_scroll_envs
-            .as_ref()
-            .map(|envs| {
-                envs.iter()
-                    .map(|(key, value)| (*key, value.as_str()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect::<Vec<_>>();
         let before_pty = Instant::now();
         let added_window_cwd = (existing_windows > 0).then(dirs::home_dir).flatten();
         let pty = PtyChild::spawn_default_shell_with_command_env_and_cwd(
@@ -609,6 +606,7 @@ impl GpuApp {
                 mouse_row: 0,
                 selecting: false,
                 scheduler: FrameScheduler::default(),
+                synchronized_update: SynchronizedUpdateGate::default(),
                 watcher_stop: stop,
                 open_window_start: Some(start),
                 cpu_time_started,
@@ -983,16 +981,23 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
                     state.startup_timing.mark_pty_event(Instant::now());
                     let bytes_read = drain_pty(state);
                     if bytes_read > 0 {
-                        let work = crate::frontend::classify_redraw_work(&state.terminal, true);
-                        // Large TUI frames are emitted across multiple PTY reads.
-                        // Coalescing heavy damage prevents partially parsed child
-                        // frames from being presented during native pane scrolling.
-                        let should_redraw_now =
-                            state
-                                .scheduler
-                                .mark_io_processed(Instant::now(), FRAME_INTERVAL, work);
-                        if should_redraw_now {
-                            state.renderer.window.request_redraw();
+                        let now = Instant::now();
+                        match state
+                            .synchronized_update
+                            .observe(state.terminal.synchronized_update_active(), now)
+                        {
+                            SynchronizedUpdateAction::Hold => {}
+                            SynchronizedUpdateAction::Release => {
+                                state.scheduler.mark_redraw_needed();
+                                state.renderer.window.request_redraw();
+                            }
+                            SynchronizedUpdateAction::Pass => {
+                                let work =
+                                    crate::frontend::classify_redraw_work(&state.terminal, true);
+                                if state.scheduler.mark_io_processed(now, FRAME_INTERVAL, work) {
+                                    state.renderer.window.request_redraw();
+                                }
+                            }
                         }
                     }
                     if state.pty_closed {
@@ -1390,6 +1395,10 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
                         if self.suspended {
                             return;
                         }
+                        if state.terminal.synchronized_update_active() {
+                            let _ = state.synchronized_update.observe(true, Instant::now());
+                            return;
+                        }
                         if self.config.scrollback.smooth {
                             let _ = state.smooth_scroll.advance(
                                 Instant::now(),
@@ -1530,6 +1539,19 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
         let now = Instant::now();
 
         for (winit_id, state) in &mut self.windows {
+            if state.terminal.synchronized_update_active() {
+                let _ = state.synchronized_update.observe(true, now);
+                if state.synchronized_update.expire(now) {
+                    state.terminal.finish_synchronized_update();
+                    state.scheduler.mark_redraw_needed();
+                    redraw_ids.push(*winit_id);
+                } else if let Some(deadline) = state.synchronized_update.deadline() {
+                    earliest_deadline = earlier_deadline(earliest_deadline, deadline);
+                }
+                if state.terminal.synchronized_update_active() {
+                    continue;
+                }
+            }
             let scheduler = &mut state.scheduler;
             let decision: FrameDecision = scheduler.prepare_redraw(now, RedrawWork::default);
             if let Some(deadline) = decision.wait_until {

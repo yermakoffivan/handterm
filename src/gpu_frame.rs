@@ -1,4 +1,5 @@
 use crate::frontend::{ViewportScroll, compute_scrollbar_geometry};
+use crate::kitty_placeholders::{KittyVirtualCell, is_kitty_unicode_placeholder};
 use crate::terminal::{CursorStyle, KittyPlacement, TerminalView};
 use crate::visual::{resolve_cell_colors, resolve_underline_color};
 
@@ -236,7 +237,8 @@ pub(crate) fn build_cell_instances(
     let mut glyph_left_pad = 0.0f32;
     let mut glyph_top_pad = 0.0f32;
 
-    if (ci.ch > 0x20 || ci.grapheme.is_some())
+    if !is_kitty_unicode_placeholder(ci.ch, ci.grapheme.as_deref())
+        && (ci.ch > 0x20 || ci.grapheme.is_some())
         && let Some(entry) = glyph_entry
         && entry.width > 0
     {
@@ -393,7 +395,9 @@ pub(crate) fn fill_text_batches<F>(
         .reserve(1usize.saturating_sub(batches.overlay_instances.capacity()));
 
     for ci in cell_infos {
-        let glyph_entry = if ci.ch > 0x20 || ci.grapheme.is_some() {
+        let glyph_entry = if !is_kitty_unicode_placeholder(ci.ch, ci.grapheme.as_deref())
+            && (ci.ch > 0x20 || ci.grapheme.is_some())
+        {
             glyph_entry_for(ci)
         } else {
             None
@@ -526,6 +530,72 @@ pub(crate) fn fill_image_instances_with_viewport_offset<F>(
     }
 }
 
+pub(crate) fn fill_image_instances_with_history<F>(
+    placements: &[KittyPlacement],
+    cell_w: f32,
+    cell_h: f32,
+    history_rows: u64,
+    viewport_scroll: ViewportScroll,
+    image_instances: &mut Vec<ImageInstance>,
+    mut image_rect_for: F,
+) where
+    F: FnMut(&KittyPlacement) -> Option<AtlasImageRect>,
+{
+    let sampled_top = history_rows.saturating_sub(viewport_scroll.sample_offset as u64);
+    let fractional_offset_y = viewport_scroll.viewport_offset_y(cell_h);
+    image_instances.clear();
+    image_instances.reserve(placements.len().saturating_sub(image_instances.capacity()));
+    for placement in placements {
+        if let Some(entry) = image_rect_for(placement) {
+            let mut instance = image_instance_for_placement(placement, entry, cell_w, cell_h);
+            let relative_rows = if placement.row >= sampled_top {
+                (placement.row - sampled_top) as f64
+            } else {
+                -((sampled_top - placement.row) as f64)
+            };
+            instance.pos[1] = (relative_rows * cell_h as f64) as f32 + fractional_offset_y;
+            image_instances.push(instance);
+        }
+    }
+}
+
+pub(crate) fn append_virtual_image_instances<F>(
+    virtual_cells: &[KittyVirtualCell],
+    cell_w: f32,
+    cell_h: f32,
+    viewport_offset_y: f32,
+    image_instances: &mut Vec<ImageInstance>,
+    mut image_rect_for: F,
+) where
+    F: FnMut(&KittyVirtualCell) -> Option<AtlasImageRect>,
+{
+    image_instances.reserve(virtual_cells.len());
+    for virtual_cell in virtual_cells {
+        let Some(entry) = image_rect_for(virtual_cell) else {
+            continue;
+        };
+        let source_x = virtual_cell.image_col as f32 * cell_w;
+        let source_y = virtual_cell.image_row as f32 * cell_h;
+        if source_x >= entry.width as f32 || source_y >= entry.height as f32 {
+            continue;
+        }
+        let width = cell_w.min(entry.width as f32 - source_x);
+        let height = cell_h.min(entry.height as f32 - source_y);
+        if width <= 0.0 || height <= 0.0 {
+            continue;
+        }
+        image_instances.push(ImageInstance {
+            pos: [
+                virtual_cell.col as f32 * cell_w,
+                virtual_cell.row as f32 * cell_h + viewport_offset_y,
+            ],
+            size: [width, height],
+            uv_offset: [entry.x as f32 + source_x, entry.y as f32 + source_y],
+            uv_size: [width, height],
+        });
+    }
+}
+
 fn cell_span(cell: &crate::grid::Cell) -> usize {
     if cell.flags & crate::grid::FLAG_WIDE != 0 {
         2
@@ -578,11 +648,152 @@ mod tests {
         assert_eq!(scroll.sample_offset, 1);
         assert_eq!(scroll.extra_visible_rows(), 1);
         assert!((scroll.viewport_offset_y(16.0) + 12.0).abs() < f32::EPSILON);
+        assert!((scroll.live_grid_offset_y(16.0) - 4.0).abs() < f32::EPSILON);
 
         let exact = ViewportScroll::from_scroll_rows(2.0);
         assert_eq!(exact.sample_offset, 2);
         assert_eq!(exact.extra_visible_rows(), 0);
         assert_eq!(exact.viewport_offset_y(16.0), 0.0);
+        assert_eq!(exact.live_grid_offset_y(16.0), 32.0);
+    }
+
+    #[test]
+    fn ordinary_kitty_placement_tracks_output_and_fractional_history() {
+        fn rect_for(_: &KittyPlacement) -> Option<AtlasImageRect> {
+            Some(AtlasImageRect {
+                x: 100,
+                y: 200,
+                width: 24,
+                height: 32,
+            })
+        }
+
+        let placement = KittyPlacement {
+            image_id: 7,
+            col: 2,
+            row: 1,
+            cols: 3,
+            rows: 2,
+        };
+        let mut instances = Vec::new();
+
+        fill_image_instances_with_history(
+            std::slice::from_ref(&placement),
+            8.0,
+            16.0,
+            2,
+            ViewportScroll::ZERO,
+            &mut instances,
+            rect_for,
+        );
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].pos, [16.0, -16.0]);
+
+        fill_image_instances_with_history(
+            std::slice::from_ref(&placement),
+            8.0,
+            16.0,
+            2,
+            ViewportScroll::from_scroll_rows(1.0),
+            &mut instances,
+            rect_for,
+        );
+        assert_eq!(instances[0].pos, [16.0, 0.0]);
+
+        fill_image_instances_with_history(
+            std::slice::from_ref(&placement),
+            8.0,
+            16.0,
+            2,
+            ViewportScroll::from_scroll_rows(1.25),
+            &mut instances,
+            rect_for,
+        );
+        assert_eq!(instances[0].pos, [16.0, 4.0]);
+        assert_eq!(instances[0].size, [24.0, 32.0]);
+        assert_eq!(instances[0].uv_offset, [100.0, 200.0]);
+        assert_eq!(instances[0].uv_size, [24.0, 32.0]);
+    }
+
+    #[test]
+    fn kitty_placeholder_never_generates_a_fallback_glyph_instance() {
+        let ci = CellInfo {
+            row: 0,
+            col: 0,
+            ch: crate::kitty_placeholders::KITTY_UNICODE_PLACEHOLDER,
+            grapheme: Some("\u{10eeee}\u{0305}\u{0305}\u{0305}".into()),
+            cells: 1,
+            cell: crate::grid::Cell::BLANK,
+            selected: false,
+            is_cursor_block: false,
+            cursor_style: None,
+        };
+        let (_, foreground, _) = build_cell_instances(
+            &ci,
+            test_style(),
+            Some(GlyphAtlasEntry {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 16,
+                left_pad: 0,
+                top_pad: 0,
+                is_color: false,
+            }),
+        );
+        assert!(foreground.is_none());
+    }
+
+    #[test]
+    fn kitty_virtual_cell_maps_to_a_cropped_gpu_image_instance() {
+        let cell = KittyVirtualCell {
+            image_id: 7,
+            image_col: 2,
+            image_row: 1,
+            col: 3,
+            row: 4,
+        };
+        let mut instances = Vec::new();
+        append_virtual_image_instances(&[cell], 8.0, 16.0, -4.0, &mut instances, |_| {
+            Some(AtlasImageRect {
+                x: 100,
+                y: 200,
+                width: 64,
+                height: 48,
+            })
+        });
+
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].pos, [24.0, 60.0]);
+        assert_eq!(instances[0].size, [8.0, 16.0]);
+        assert_eq!(instances[0].uv_offset, [116.0, 216.0]);
+        assert_eq!(instances[0].uv_size, [8.0, 16.0]);
+    }
+
+    #[test]
+    fn kitty_virtual_cell_clips_source_and_destination_at_image_edges() {
+        let cell = KittyVirtualCell {
+            image_id: 7,
+            image_col: 7,
+            image_row: 2,
+            col: 1,
+            row: 0,
+        };
+        let mut instances = Vec::new();
+        append_virtual_image_instances(&[cell], 8.0, 16.0, -4.0, &mut instances, |_| {
+            Some(AtlasImageRect {
+                x: 100,
+                y: 200,
+                width: 60,
+                height: 40,
+            })
+        });
+
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].pos, [8.0, -4.0]);
+        assert_eq!(instances[0].size, [4.0, 8.0]);
+        assert_eq!(instances[0].uv_offset, [156.0, 232.0]);
+        assert_eq!(instances[0].uv_size, [4.0, 8.0]);
     }
 
     #[test]
@@ -983,7 +1194,8 @@ mod tests {
                 (cols, rows),
                 (
                     (placement.col * atlas.cell_width) as i32,
-                    (placement.row * atlas.cell_height) as i32,
+                    (usize::try_from(placement.row).expect("test placement row fits usize")
+                        * atlas.cell_height) as i32,
                     placement.cols.max(1) * atlas.cell_width,
                     placement.rows.max(1) * atlas.cell_height,
                 ),
