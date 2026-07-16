@@ -539,16 +539,22 @@ pub(crate) fn fill_image_instances_with_history<F>(
     cell_h: f32,
     history_rows: u64,
     viewport_scroll: ViewportScroll,
+    visible_rows: usize,
     image_instances: &mut Vec<ImageInstance>,
     mut image_rect_for: F,
 ) where
     F: FnMut(&KittyPlacement) -> Option<AtlasImageRect>,
 {
     let sampled_top = history_rows.saturating_sub(viewport_scroll.sample_offset as u64);
+    let sampled_bottom = sampled_top.saturating_add(visible_rows as u64);
     let fractional_offset_y = viewport_scroll.viewport_offset_y(cell_h);
     image_instances.clear();
     image_instances.reserve(placements.len().saturating_sub(image_instances.capacity()));
     for placement in placements {
+        let placement_bottom = placement.row.saturating_add(placement.rows.max(1) as u64);
+        if placement_bottom <= sampled_top || placement.row >= sampled_bottom {
+            continue;
+        }
         if let Some(entry) = image_rect_for(placement) {
             let mut instance = image_instance_for_placement(placement, entry, cell_w, cell_h);
             let relative_rows = if placement.row >= sampled_top {
@@ -686,6 +692,7 @@ mod tests {
             16.0,
             2,
             ViewportScroll::ZERO,
+            2,
             &mut instances,
             rect_for,
         );
@@ -698,6 +705,7 @@ mod tests {
             16.0,
             2,
             ViewportScroll::from_scroll_rows(1.0),
+            2,
             &mut instances,
             rect_for,
         );
@@ -709,6 +717,7 @@ mod tests {
             16.0,
             2,
             ViewportScroll::from_scroll_rows(1.25),
+            3,
             &mut instances,
             rect_for,
         );

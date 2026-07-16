@@ -584,6 +584,22 @@ impl Terminal {
                 }
             }
         }
+        self.prune_evicted_kitty_placements();
+    }
+
+    fn prune_evicted_kitty_placements(&mut self) {
+        let oldest_retained_row = self
+            .grid
+            .history_rows()
+            .saturating_sub(self.grid.scrollback_len() as u64);
+        let before = self.kitty_placements.len();
+        self.kitty_placements.retain(|placement| {
+            placement.row.saturating_add(placement.rows.max(1) as u64) > oldest_retained_row
+        });
+        if self.kitty_placements.len() != before {
+            self.kitty_generation = self.kitty_generation.wrapping_add(1);
+            self.grid.mark_all_dirty();
+        }
     }
 
     fn active_charset_is_dec_special(&self) -> bool {
@@ -2317,6 +2333,19 @@ mod tests {
 
         let image = t.kitty_image(17).expect("virtual kitty image should exist");
         assert_eq!(image.data, vec![0xff, 0x00, 0x00, 0xff]);
+        assert!(t.kitty_placements.is_empty());
+    }
+
+    #[test]
+    fn kitty_ordinary_placement_is_pruned_after_scrollback_eviction() {
+        let mut t = Terminal::new_with_scrollback(4, 1, 1);
+        t.process(b"\x1b_Ga=T,i=17,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        assert_eq!(t.kitty_placements.len(), 1);
+
+        t.process(b"\n");
+        assert_eq!(t.kitty_placements.len(), 1);
+        t.process(b"\n");
+
         assert!(t.kitty_placements.is_empty());
     }
 

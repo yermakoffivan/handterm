@@ -1151,6 +1151,7 @@ pub fn render_surface_state_profiled_with_scroll(
         cell_h,
         terminal.grid().history_rows(),
         viewport_scroll,
+        terminal.grid().rows + viewport_scroll.extra_visible_rows(),
         &mut image_instances,
         |placement| {
             ensure_kitty_image_in_atlas(
