@@ -21,7 +21,7 @@ use crate::host_input::{
     SyntheticInputTarget, apply_synthetic_ime_commit, apply_synthetic_key_event,
 };
 use crate::ipc::{IpcAction, IpcServer, Request, Response};
-use crate::native_scroll::{NativeScrollBridge, child_process_envs};
+use crate::native_scroll::{NativeScrollBridge, PaneKind, PaneVisualScroll, child_process_envs};
 use crate::platform::{copy_to_clipboard, open_url, paste_from_clipboard};
 use crate::profiling::{ProcessCpuTime, emit_structured_profile_event};
 use crate::pty::PtyChild;
@@ -329,6 +329,13 @@ impl GpuApp {
         } else {
             0.0
         }
+    }
+
+    fn current_pane_visual_scroll(state: &mut GpuWindowState) -> Option<PaneVisualScroll> {
+        let bridge = state.native_scroll.as_mut()?;
+        bridge
+            .visual_scroll(PaneKind::Chat)
+            .or_else(|| bridge.visual_scroll(PaneKind::SidePanel))
     }
 
     fn mouse_row_for_position(
@@ -1363,11 +1370,7 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
                                 },
                             )
                         {
-                            // The bridge only queues a command. Jcode's resulting
-                            // PTY damage is the authoritative signal that a new
-                            // frame is ready. Starting host hot-frame scheduling
-                            // here races unchanged retained frames against the
-                            // asynchronous child update and causes visible flicker.
+                            state.scheduler.mark_redraw_needed();
                             return;
                         }
                         if state.terminal.mouse_mode != crate::terminal::MouseMode::Off {
@@ -1422,6 +1425,7 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
                             Self::sync_scrollback_view(state);
                         }
                         let viewport_scroll = Self::current_viewport_scroll(state, &self.config);
+                        let visual_scroll = Self::current_pane_visual_scroll(state);
                         if !state.first_frame_logged {
                             let render_profile = render_surface_state_profiled_with_scroll(
                                 &mut state.renderer,
@@ -1429,6 +1433,7 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
                                 atlas,
                                 &self.config,
                                 viewport_scroll,
+                                visual_scroll,
                             );
                             state.first_frame_logged = true;
                             // The initial window size was clamped on macOS to stop
@@ -1520,6 +1525,7 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
                                 atlas,
                                 &self.config,
                                 viewport_scroll,
+                                visual_scroll,
                             );
                             state.startup_timing.mark_present(Instant::now());
                             if state.startup_timing.emit_if_ready("gpu host", state.id)

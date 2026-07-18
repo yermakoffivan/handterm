@@ -1,5 +1,6 @@
 use crate::frontend::{ViewportScroll, compute_scrollbar_geometry};
 use crate::kitty_placeholders::{KittyVirtualCell, is_kitty_unicode_placeholder};
+use crate::native_scroll::PaneVisualScroll;
 use crate::terminal::{CursorStyle, KittyPlacement, TerminalView};
 use crate::visual::{resolve_cell_colors, resolve_underline_color};
 
@@ -420,6 +421,133 @@ pub(crate) fn fill_text_batches<F>(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PixelClipRect {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+impl PixelClipRect {
+    fn from_visual_scroll(scroll: PaneVisualScroll, cell_w: f32, cell_h: f32) -> Self {
+        let left = f32::from(scroll.x) * cell_w;
+        let top = f32::from(scroll.y) * cell_h;
+        Self {
+            left,
+            top,
+            right: left + f32::from(scroll.width) * cell_w,
+            bottom: top + f32::from(scroll.height) * cell_h,
+        }
+    }
+
+    fn contains_cell_origin(&self, pos: [f32; 2]) -> bool {
+        pos[0] >= self.left && pos[0] < self.right && pos[1] >= self.top && pos[1] < self.bottom
+    }
+}
+
+fn clip_interval(start: f32, size: f32, min: f32, max: f32) -> Option<(f32, f32, f32, f32)> {
+    let end = start + size;
+    let clipped_start = start.max(min);
+    let clipped_end = end.min(max);
+    (clipped_end > clipped_start).then_some((
+        clipped_start,
+        clipped_end - clipped_start,
+        clipped_start - start,
+        end - clipped_end,
+    ))
+}
+
+fn apply_pane_clip_to_cell(instance: &mut CellInstance, clip: PixelClipRect, dy: f32) -> bool {
+    if !clip.contains_cell_origin(instance.pos) {
+        return true;
+    }
+
+    instance.pos[1] += dy;
+    let Some((x, width, clipped_left, clipped_right)) =
+        clip_interval(instance.pos[0], instance.size[0], clip.left, clip.right)
+    else {
+        return false;
+    };
+    let Some((y, height, clipped_top, clipped_bottom)) =
+        clip_interval(instance.pos[1], instance.size[1], clip.top, clip.bottom)
+    else {
+        return false;
+    };
+
+    if instance.uv_size[0] > 0.0 && instance.size[0] > 0.0 {
+        let uv_per_px = instance.uv_size[0] / instance.size[0];
+        instance.uv_offset[0] += clipped_left * uv_per_px;
+        instance.uv_size[0] -= (clipped_left + clipped_right) * uv_per_px;
+    }
+    if instance.uv_size[1] > 0.0 && instance.size[1] > 0.0 {
+        let uv_per_px = instance.uv_size[1] / instance.size[1];
+        instance.uv_offset[1] += clipped_top * uv_per_px;
+        instance.uv_size[1] -= (clipped_top + clipped_bottom) * uv_per_px;
+    }
+
+    instance.pos = [x, y];
+    instance.size = [width, height];
+    true
+}
+
+fn apply_pane_clip_to_image(instance: &mut ImageInstance, clip: PixelClipRect, dy: f32) -> bool {
+    if !clip.contains_cell_origin(instance.pos) {
+        return true;
+    }
+
+    instance.pos[1] += dy;
+    let Some((x, width, clipped_left, clipped_right)) =
+        clip_interval(instance.pos[0], instance.size[0], clip.left, clip.right)
+    else {
+        return false;
+    };
+    let Some((y, height, clipped_top, clipped_bottom)) =
+        clip_interval(instance.pos[1], instance.size[1], clip.top, clip.bottom)
+    else {
+        return false;
+    };
+
+    if instance.size[0] > 0.0 {
+        let uv_per_px = instance.uv_size[0] / instance.size[0];
+        instance.uv_offset[0] += clipped_left * uv_per_px;
+        instance.uv_size[0] -= (clipped_left + clipped_right) * uv_per_px;
+    }
+    if instance.size[1] > 0.0 {
+        let uv_per_px = instance.uv_size[1] / instance.size[1];
+        instance.uv_offset[1] += clipped_top * uv_per_px;
+        instance.uv_size[1] -= (clipped_top + clipped_bottom) * uv_per_px;
+    }
+
+    instance.pos = [x, y];
+    instance.size = [width, height];
+    true
+}
+
+pub(crate) fn apply_pane_visual_scroll(
+    batches: &mut FrameTextBatches,
+    image_instances: &mut Vec<ImageInstance>,
+    visual_scroll: Option<PaneVisualScroll>,
+    cell_w: f32,
+    cell_h: f32,
+) {
+    let Some(scroll) = visual_scroll else {
+        return;
+    };
+    let clip = PixelClipRect::from_visual_scroll(scroll, cell_w, cell_h);
+    let dy = -scroll.offset_rows * cell_h;
+    batches
+        .bg_instances
+        .retain_mut(|instance| apply_pane_clip_to_cell(instance, clip, dy));
+    batches
+        .fg_instances
+        .retain_mut(|instance| apply_pane_clip_to_cell(instance, clip, dy));
+    batches
+        .overlay_instances
+        .retain_mut(|instance| apply_pane_clip_to_cell(instance, clip, dy));
+    image_instances.retain_mut(|instance| apply_pane_clip_to_image(instance, clip, dy));
+}
+
 fn solid_rect_instance(pos: [f32; 2], size: [f32; 2], bg: [f32; 4]) -> CellInstance {
     CellInstance {
         pos,
@@ -632,6 +760,7 @@ mod tests {
     use crate::config::AppConfig;
     use crate::font::GlyphAtlas;
     use crate::grid::{ATTR_STRIKETHROUGH, ATTR_UNDERLINE};
+    use crate::native_scroll::PaneKind;
     use crate::render::OffscreenRenderer;
     use crate::terminal::Terminal;
     use crate::visual::{resolve_cell_colors, resolve_underline_color};
@@ -816,6 +945,81 @@ mod tests {
         assert_eq!(instances[0].size, [4.0, 8.0]);
         assert_eq!(instances[0].uv_offset, [156.0, 232.0]);
         assert_eq!(instances[0].uv_size, [4.0, 8.0]);
+    }
+
+    #[test]
+    fn pane_visual_scroll_translates_and_clips_gpu_cell_instances() {
+        let mut batches = FrameTextBatches {
+            bg_instances: vec![solid_rect_instance([8.0, 16.0], [8.0, 16.0], [1.0; 4])],
+            fg_instances: vec![CellInstance {
+                pos: [8.0, 16.0],
+                size: [8.0, 16.0],
+                uv_offset: [32.0, 64.0],
+                uv_size: [8.0, 16.0],
+                fg: [1.0; 4],
+                bg: [0.0; 4],
+                deco: [1.0; 4],
+                flags: FLAG_HAS_GLYPH,
+                _pad: [0; 2],
+            }],
+            overlay_instances: vec![solid_rect_instance([0.0, 16.0], [8.0, 16.0], [0.5; 4])],
+        };
+        let mut images = Vec::new();
+
+        apply_pane_visual_scroll(
+            &mut batches,
+            &mut images,
+            Some(PaneVisualScroll {
+                kind: PaneKind::Chat,
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+                offset_rows: 0.5,
+            }),
+            8.0,
+            16.0,
+        );
+
+        assert_eq!(batches.bg_instances[0].pos, [8.0, 16.0]);
+        assert_eq!(batches.bg_instances[0].size, [8.0, 8.0]);
+        assert_eq!(batches.fg_instances[0].pos, [8.0, 16.0]);
+        assert_eq!(batches.fg_instances[0].size, [8.0, 8.0]);
+        assert_eq!(batches.fg_instances[0].uv_offset, [32.0, 72.0]);
+        assert_eq!(batches.fg_instances[0].uv_size, [8.0, 8.0]);
+        assert_eq!(batches.overlay_instances[0].pos, [0.0, 16.0]);
+    }
+
+    #[test]
+    fn pane_visual_scroll_translates_and_clips_gpu_image_instances() {
+        let mut batches = FrameTextBatches::default();
+        let mut images = vec![ImageInstance {
+            pos: [8.0, 16.0],
+            size: [16.0, 16.0],
+            uv_offset: [100.0, 200.0],
+            uv_size: [16.0, 16.0],
+        }];
+
+        apply_pane_visual_scroll(
+            &mut batches,
+            &mut images,
+            Some(PaneVisualScroll {
+                kind: PaneKind::SidePanel,
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 1,
+                offset_rows: -0.25,
+            }),
+            8.0,
+            16.0,
+        );
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].pos, [8.0, 20.0]);
+        assert_eq!(images[0].size, [16.0, 12.0]);
+        assert_eq!(images[0].uv_offset, [100.0, 200.0]);
+        assert_eq!(images[0].uv_size, [16.0, 12.0]);
     }
 
     #[test]

@@ -4,10 +4,11 @@ use crate::frontend::{ViewportScroll, VisualState, visual_signature};
 use crate::gpu_frame::{
     AtlasImageRect, CellInfo, CellInstance, FrameBatchStyle, FrameTextBatches, GlyphAtlasEntry,
     ImageInstance, append_scrollbar_overlay_instances, append_virtual_image_instances,
-    fill_cell_infos, fill_cell_infos_with_scroll, fill_image_instances_with_history,
-    fill_text_batches,
+    apply_pane_visual_scroll, fill_cell_infos, fill_cell_infos_with_scroll,
+    fill_image_instances_with_history, fill_text_batches,
 };
 use crate::kitty_placeholders::fill_kitty_virtual_cells;
+use crate::native_scroll::PaneVisualScroll;
 use crate::terminal::TerminalView;
 use anyhow::{Context, Result};
 use handterm_common::graphics::KittyImage;
@@ -1011,8 +1012,16 @@ pub fn render_surface_state_with_scroll(
     atlas: &mut GlyphAtlas,
     config: &AppConfig,
     scroll_rows: f32,
+    visual_scroll: Option<PaneVisualScroll>,
 ) {
-    let _ = render_surface_state_profiled_with_scroll(state, terminal, atlas, config, scroll_rows);
+    let _ = render_surface_state_profiled_with_scroll(
+        state,
+        terminal,
+        atlas,
+        config,
+        scroll_rows,
+        visual_scroll,
+    );
 }
 
 pub fn render_surface_state_profiled_with_scroll(
@@ -1021,6 +1030,7 @@ pub fn render_surface_state_profiled_with_scroll(
     atlas: &mut GlyphAtlas,
     config: &AppConfig,
     scroll_rows: f32,
+    visual_scroll: Option<PaneVisualScroll>,
 ) -> Option<GpuRenderProfile> {
     let total_start = Instant::now();
     let current_visual = VisualState::capture(terminal);
@@ -1031,6 +1041,7 @@ pub fn render_surface_state_profiled_with_scroll(
     let viewport_quantized = (effective_scroll_rows * 1024.0).round() as u32;
     if state.last_presented_signature == Some(signature)
         && state.last_viewport_scroll_quantized == Some(viewport_quantized)
+        && visual_scroll.is_none()
     {
         terminal.grid_mut().clear_dirty();
         state.last_visual_state = Some(current_visual);
@@ -1203,6 +1214,14 @@ pub fn render_surface_state_profiled_with_scroll(
                 height: entry.height,
             })
         },
+    );
+
+    apply_pane_visual_scroll(
+        &mut text_batches,
+        &mut image_instances,
+        visual_scroll,
+        cell_w,
+        cell_h,
     );
 
     let max_supported_image_instances =
