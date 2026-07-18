@@ -384,6 +384,15 @@ impl GpuApp {
         }
     }
 
+    fn native_wheel_delta_rows(delta: &MouseScrollDelta, cell_height: f32) -> (bool, f32) {
+        match delta {
+            MouseScrollDelta::LineDelta(_, y) => (*y > 0.0, y.abs()),
+            MouseScrollDelta::PixelDelta(pos) => {
+                (pos.y > 0.0, (pos.y.abs() as f32) / cell_height.max(1.0))
+            }
+        }
+    }
+
     fn resolve_dpi(&self, event_loop: &ActiveEventLoop) -> Result<u32> {
         if let Some(id) = self.focused_window
             && let Some(winit_id) = self.window_ids.get(&id)
@@ -1355,6 +1364,8 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
                         }
                     }
                     WindowEvent::MouseWheel { delta, .. } => {
+                        let (native_up, native_delta_rows) =
+                            Self::native_wheel_delta_rows(&delta, atlas.cell_height as f32);
                         let (up, delta_rows) =
                             Self::wheel_delta_rows(&self.config, &delta, atlas.cell_height as f32);
                         let lines = delta_rows.ceil().max(1.0) as usize;
@@ -1363,10 +1374,10 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
                                 bridge.hovered_pane(state.mouse_col, state.mouse_row)
                             && bridge.send_scroll_delta(
                                 pane,
-                                if up {
-                                    -delta_rows.max(0.1)
+                                if native_up {
+                                    -native_delta_rows
                                 } else {
-                                    delta_rows.max(0.1)
+                                    native_delta_rows
                                 },
                             )
                         {
@@ -1715,6 +1726,17 @@ mod tests {
         );
 
         assert!(delta_rows >= 1.0);
+    }
+
+    #[test]
+    fn native_pixel_wheel_delta_matches_physical_fraction_without_speed_scaling() {
+        let (up, delta_rows) = GpuApp::native_wheel_delta_rows(
+            &MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, -4.0)),
+            16.0,
+        );
+
+        assert!(!up);
+        assert!((delta_rows - 0.25).abs() < f32::EPSILON);
     }
 
     #[test]

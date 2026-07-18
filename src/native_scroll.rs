@@ -258,7 +258,21 @@ impl NativeScrollBridge {
                 .offset_rows
                 .trunc()
                 .clamp(i32::MIN as f32, i32::MAX as f32) as i32;
-            desired_rows.saturating_sub(motion.outstanding_rows)
+            let requested = desired_rows.saturating_sub(motion.outstanding_rows);
+            // Never send a compensating command while an earlier command in the
+            // opposite direction is still in flight. Jcode may publish the two
+            // intermediate positions as separate snapshots; treating only their
+            // net value as outstanding makes the visual offset jump by one row
+            // when the first snapshot arrives. Keep the reversed motion visual
+            // until the prior row is acknowledged instead.
+            if motion.outstanding_rows != 0
+                && requested != 0
+                && requested.signum() != motion.outstanding_rows.signum()
+            {
+                0
+            } else {
+                requested
+            }
         };
         if steps == 0 {
             return true;
@@ -614,7 +628,7 @@ mod tests {
             .expect("socket env should be present");
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        let _stream = loop {
+        let mut stream = loop {
             match UnixStream::connect(&socket_path) {
                 Ok(stream) => break stream,
                 Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
@@ -635,14 +649,28 @@ mod tests {
         let _ = bridge.send_scroll_delta(PaneKind::Chat, 0.7);
         assert!((bridge.chat_motion.offset_rows - 1.1).abs() < 1e-5);
         assert_eq!(bridge.chat_motion.outstanding_rows, 1);
+        assert_eq!(
+            read_host_command(&mut stream),
+            Some(HostToApp::Scroll {
+                pane: PaneKind::Chat,
+                delta: 1,
+            })
+        );
         let visual = bridge.visual_scroll(PaneKind::Chat).expect("visual motion");
         assert!((visual.offset_rows - 1.1).abs() < 1e-5);
+
+        assert!(bridge.send_scroll_delta(PaneKind::Chat, -0.5));
+        assert!((bridge.chat_motion.offset_rows - 0.6).abs() < 1e-5);
+        assert_eq!(
+            bridge.chat_motion.outstanding_rows, 1,
+            "the in-flight forward row must not be cancelled before acknowledgement"
+        );
 
         install_scrollable_chat_snapshot(&bridge, 1);
         let visual = bridge
             .visual_scroll(PaneKind::Chat)
             .expect("fractional remainder remains after acknowledgement");
-        assert!((visual.offset_rows - 0.1).abs() < 1e-5);
+        assert!((visual.offset_rows + 0.4).abs() < 1e-5);
         assert_eq!(bridge.chat_motion.outstanding_rows, 0);
     }
 
