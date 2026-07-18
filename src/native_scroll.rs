@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -31,6 +32,10 @@ pub struct PaneState {
     pub position: usize,
     pub content_length: usize,
     pub viewport_length: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_seq: Option<u64>,
+    #[serde(default)]
+    pub applied_delta: i32,
 }
 
 impl PaneState {
@@ -70,7 +75,17 @@ pub enum AppToHost {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostToApp {
-    Scroll { pane: PaneKind, delta: i32 },
+    Scroll {
+        pane: PaneKind,
+        delta: i32,
+        seq: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingScroll {
+    seq: u64,
+    delta: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -86,11 +101,12 @@ pub struct PaneVisualScroll {
     pub offset_rows: f32,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct PaneMotion {
     offset_rows: f32,
     outstanding_rows: i32,
     last_position: Option<usize>,
+    pending: VecDeque<PendingScroll>,
 }
 
 #[derive(Debug)]
@@ -100,6 +116,7 @@ pub struct NativeScrollBridge {
     command_tx: Sender<HostToApp>,
     connected: Arc<AtomicBool>,
     connection_generation: Arc<AtomicU64>,
+    next_seq: u64,
     observed_connection_generation: u64,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -145,6 +162,7 @@ impl NativeScrollBridge {
             command_tx,
             connected,
             connection_generation,
+            next_seq: 1,
             observed_connection_generation: 0,
             stop,
             thread: Some(thread),
@@ -204,11 +222,37 @@ impl NativeScrollBridge {
                 -i32::try_from(previous - state.position).unwrap_or(i32::MAX)
             };
             if acknowledged != 0 {
-                motion.offset_rows -= acknowledged as f32;
-                motion.outstanding_rows = motion.outstanding_rows.saturating_sub(acknowledged);
+                // Content growth and app-side auto-scroll can move the reported
+                // position without acknowledging a native-scroll command. Native
+                // scroll reconciliation is driven only by explicit seq acks below.
             }
         }
         motion.last_position = Some(state.position);
+
+        if let Some(applied_seq) = state.applied_seq {
+            let mut acked_requested = 0i32;
+            let mut matched = false;
+            while let Some(pending) = motion.pending.pop_front() {
+                acked_requested = acked_requested.saturating_add(pending.delta);
+                matched |= pending.seq == applied_seq;
+                if matched {
+                    break;
+                }
+            }
+            if matched {
+                motion.outstanding_rows = motion.outstanding_rows.saturating_sub(acked_requested);
+                motion.offset_rows -= state.applied_delta as f32;
+            } else if !motion
+                .pending
+                .iter()
+                .any(|pending| pending.seq > applied_seq)
+            {
+                // Self-heal after a reconnect or peer bug that acknowledges an
+                // unknown sequence: drop stale accounting rather than ratcheting.
+                motion.pending.clear();
+                motion.outstanding_rows = 0;
+            }
+        }
 
         let max_position = state.content_length.saturating_sub(state.viewport_length);
         let min_offset = -(state.position as f32);
@@ -277,13 +321,22 @@ impl NativeScrollBridge {
         if steps == 0 {
             return true;
         }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1).max(1);
         if self
             .command_tx
-            .send(HostToApp::Scroll { pane, delta: steps })
+            .send(HostToApp::Scroll {
+                pane,
+                delta: steps,
+                seq,
+            })
             .is_ok()
         {
             let motion = self.motion_mut(pane);
             motion.outstanding_rows = motion.outstanding_rows.saturating_add(steps);
+            motion
+                .pending
+                .push_back(PendingScroll { seq, delta: steps });
             true
         } else {
             false
@@ -526,6 +579,16 @@ mod tests {
     use std::time::Instant;
 
     fn install_scrollable_chat_snapshot(bridge: &NativeScrollBridge, position: usize) {
+        install_scrollable_chat_snapshot_with_ack(bridge, position, None, 0, 20);
+    }
+
+    fn install_scrollable_chat_snapshot_with_ack(
+        bridge: &NativeScrollBridge,
+        position: usize,
+        applied_seq: Option<u64>,
+        applied_delta: i32,
+        content_length: usize,
+    ) {
         *bridge.snapshot.lock().expect("snapshot lock") = PaneSnapshot {
             panes: vec![PaneState {
                 kind: PaneKind::Chat,
@@ -534,10 +597,22 @@ mod tests {
                 width: 10,
                 height: 4,
                 position,
-                content_length: 20,
+                content_length,
                 viewport_length: 4,
+                applied_seq: None,
+                applied_delta: 0,
             }],
         };
+        if let Some(pane) = bridge
+            .snapshot
+            .lock()
+            .expect("snapshot lock")
+            .panes
+            .first_mut()
+        {
+            pane.applied_seq = applied_seq;
+            pane.applied_delta = applied_delta;
+        }
     }
 
     #[test]
@@ -611,6 +686,8 @@ mod tests {
                 position: 0,
                 content_length: 20,
                 viewport_length: 4,
+                applied_seq: None,
+                applied_delta: 0,
             }],
         };
         assert_eq!(snapshot.hovered_pane(2, 3), Some(PaneKind::Chat));
@@ -654,6 +731,7 @@ mod tests {
             Some(HostToApp::Scroll {
                 pane: PaneKind::Chat,
                 delta: 1,
+                seq: 1,
             })
         );
         let visual = bridge.visual_scroll(PaneKind::Chat).expect("visual motion");
@@ -666,7 +744,7 @@ mod tests {
             "the in-flight forward row must not be cancelled before acknowledgement"
         );
 
-        install_scrollable_chat_snapshot(&bridge, 1);
+        install_scrollable_chat_snapshot_with_ack(&bridge, 1, Some(1), 1, 20);
         let visual = bridge
             .visual_scroll(PaneKind::Chat)
             .expect("fractional remainder remains after acknowledgement");
@@ -683,6 +761,49 @@ mod tests {
     }
 
     #[test]
+    fn content_growth_position_delta_does_not_ack_native_scroll() {
+        let mut bridge = NativeScrollBridge::new(999_996).expect("bridge should initialize");
+        bridge.connected.store(true, Ordering::Release);
+        install_scrollable_chat_snapshot(&bridge, 0);
+
+        assert!(bridge.send_scroll_delta(PaneKind::Chat, 2.0));
+        assert_eq!(bridge.chat_motion.outstanding_rows, 2);
+
+        install_scrollable_chat_snapshot_with_ack(&bridge, 2, None, 0, 30);
+        let visual = bridge.visual_scroll(PaneKind::Chat).expect("still pending");
+        assert_eq!(bridge.chat_motion.outstanding_rows, 2);
+        assert!((visual.offset_rows - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn explicit_zero_delta_ack_clears_clamped_command() {
+        let mut bridge = NativeScrollBridge::new(999_997).expect("bridge should initialize");
+        bridge.connected.store(true, Ordering::Release);
+        install_scrollable_chat_snapshot(&bridge, 15);
+
+        assert!(bridge.send_scroll_delta(PaneKind::Chat, 3.0));
+        assert_eq!(bridge.chat_motion.outstanding_rows, 1);
+        install_scrollable_chat_snapshot_with_ack(&bridge, 15, Some(1), 0, 20);
+        assert!(bridge.visual_scroll(PaneKind::Chat).is_some());
+        assert_eq!(bridge.chat_motion.outstanding_rows, 0);
+        assert!(bridge.chat_motion.pending.is_empty());
+    }
+
+    #[test]
+    fn delayed_cumulative_ack_reconciles_fifo_without_ratcheting() {
+        let mut bridge = NativeScrollBridge::new(999_998).expect("bridge should initialize");
+        bridge.connected.store(true, Ordering::Release);
+        install_scrollable_chat_snapshot(&bridge, 0);
+
+        assert!(bridge.send_scroll_delta(PaneKind::Chat, 1.0));
+        assert!(bridge.send_scroll_delta(PaneKind::Chat, 1.0));
+        assert_eq!(bridge.chat_motion.outstanding_rows, 2);
+        install_scrollable_chat_snapshot_with_ack(&bridge, 2, Some(2), 2, 20);
+        assert!(bridge.visual_scroll(PaneKind::Chat).is_none());
+        assert_eq!(bridge.chat_motion.outstanding_rows, 0);
+    }
+
+    #[test]
     fn new_connection_discards_stale_commands_and_fractional_residuals() {
         let mut bridge = NativeScrollBridge::new(999_995).expect("bridge should initialize");
         let socket_path = bridge
@@ -696,6 +817,7 @@ mod tests {
             .send(HostToApp::Scroll {
                 pane: PaneKind::Chat,
                 delta: 7,
+                seq: 99,
             })
             .expect("stale command should queue before connection");
         bridge.chat_motion.offset_rows = 0.75;
@@ -779,6 +901,8 @@ mod tests {
             position: 3,
             content_length: 20,
             viewport_length: 5,
+            applied_seq: None,
+            applied_delta: 0,
         }];
         write_line(
             &mut stream,
@@ -801,6 +925,7 @@ mod tests {
             HostToApp::Scroll {
                 pane: PaneKind::Chat,
                 delta: 2,
+                seq: 1,
             }
         );
     }
