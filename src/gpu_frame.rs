@@ -441,8 +441,10 @@ impl PixelClipRect {
         }
     }
 
-    fn contains_cell_origin(&self, pos: [f32; 2]) -> bool {
-        pos[0] >= self.left && pos[0] < self.right && pos[1] >= self.top && pos[1] < self.bottom
+    fn intersects(&self, pos: [f32; 2], size: [f32; 2]) -> bool {
+        let right = pos[0] + size[0];
+        let bottom = pos[1] + size[1];
+        right > self.left && pos[0] < self.right && bottom > self.top && pos[1] < self.bottom
     }
 }
 
@@ -459,7 +461,7 @@ fn clip_interval(start: f32, size: f32, min: f32, max: f32) -> Option<(f32, f32,
 }
 
 fn apply_pane_clip_to_cell(instance: &mut CellInstance, clip: PixelClipRect, dy: f32) -> bool {
-    if !clip.contains_cell_origin(instance.pos) {
+    if !clip.intersects(instance.pos, instance.size) {
         return true;
     }
 
@@ -492,7 +494,7 @@ fn apply_pane_clip_to_cell(instance: &mut CellInstance, clip: PixelClipRect, dy:
 }
 
 fn apply_pane_clip_to_image(instance: &mut ImageInstance, clip: PixelClipRect, dy: f32) -> bool {
-    if !clip.contains_cell_origin(instance.pos) {
+    if !clip.intersects(instance.pos, instance.size) {
         return true;
     }
 
@@ -527,25 +529,27 @@ fn apply_pane_clip_to_image(instance: &mut ImageInstance, clip: PixelClipRect, d
 pub(crate) fn apply_pane_visual_scroll(
     batches: &mut FrameTextBatches,
     image_instances: &mut Vec<ImageInstance>,
-    visual_scroll: Option<PaneVisualScroll>,
+    visual_scrolls: &[PaneVisualScroll],
     cell_w: f32,
     cell_h: f32,
 ) {
-    let Some(scroll) = visual_scroll else {
-        return;
-    };
-    let clip = PixelClipRect::from_visual_scroll(scroll, cell_w, cell_h);
-    let dy = -scroll.offset_rows * cell_h;
-    batches
-        .bg_instances
-        .retain_mut(|instance| apply_pane_clip_to_cell(instance, clip, dy));
-    batches
-        .fg_instances
-        .retain_mut(|instance| apply_pane_clip_to_cell(instance, clip, dy));
-    batches
-        .overlay_instances
-        .retain_mut(|instance| apply_pane_clip_to_cell(instance, clip, dy));
-    image_instances.retain_mut(|instance| apply_pane_clip_to_image(instance, clip, dy));
+    for scroll in visual_scrolls {
+        if !scroll.offset_rows.is_finite() {
+            continue;
+        }
+        let clip = PixelClipRect::from_visual_scroll(*scroll, cell_w, cell_h);
+        let dy = -scroll.offset_rows * cell_h;
+        batches
+            .bg_instances
+            .retain_mut(|instance| apply_pane_clip_to_cell(instance, clip, dy));
+        batches
+            .fg_instances
+            .retain_mut(|instance| apply_pane_clip_to_cell(instance, clip, dy));
+        batches
+            .overlay_instances
+            .retain_mut(|instance| apply_pane_clip_to_cell(instance, clip, dy));
+        image_instances.retain_mut(|instance| apply_pane_clip_to_image(instance, clip, dy));
+    }
 }
 
 fn solid_rect_instance(pos: [f32; 2], size: [f32; 2], bg: [f32; 4]) -> CellInstance {
@@ -969,14 +973,14 @@ mod tests {
         apply_pane_visual_scroll(
             &mut batches,
             &mut images,
-            Some(PaneVisualScroll {
+            &[PaneVisualScroll {
                 kind: PaneKind::Chat,
                 x: 1,
                 y: 1,
                 width: 2,
                 height: 2,
                 offset_rows: 0.5,
-            }),
+            }],
             8.0,
             16.0,
         );
@@ -1003,14 +1007,14 @@ mod tests {
         apply_pane_visual_scroll(
             &mut batches,
             &mut images,
-            Some(PaneVisualScroll {
+            &[PaneVisualScroll {
                 kind: PaneKind::SidePanel,
                 x: 1,
                 y: 1,
                 width: 2,
                 height: 1,
                 offset_rows: -0.25,
-            }),
+            }],
             8.0,
             16.0,
         );
@@ -1020,6 +1024,98 @@ mod tests {
         assert_eq!(images[0].size, [16.0, 12.0]);
         assert_eq!(images[0].uv_offset, [100.0, 200.0]);
         assert_eq!(images[0].uv_size, [16.0, 12.0]);
+    }
+
+    #[test]
+    fn pane_visual_scroll_applies_multiple_gpu_panes() {
+        let mut batches = FrameTextBatches {
+            bg_instances: vec![
+                solid_rect_instance([0.0, 16.0], [8.0, 16.0], [1.0; 4]),
+                solid_rect_instance([16.0, 16.0], [8.0, 16.0], [0.5; 4]),
+            ],
+            fg_instances: Vec::new(),
+            overlay_instances: Vec::new(),
+        };
+        let mut images = Vec::new();
+
+        apply_pane_visual_scroll(
+            &mut batches,
+            &mut images,
+            &[
+                PaneVisualScroll {
+                    kind: PaneKind::Chat,
+                    x: 0,
+                    y: 1,
+                    width: 1,
+                    height: 1,
+                    offset_rows: 0.25,
+                },
+                PaneVisualScroll {
+                    kind: PaneKind::SidePanel,
+                    x: 2,
+                    y: 1,
+                    width: 1,
+                    height: 1,
+                    offset_rows: -0.25,
+                },
+            ],
+            8.0,
+            16.0,
+        );
+
+        assert_eq!(batches.bg_instances[0].pos, [0.0, 16.0]);
+        assert_eq!(batches.bg_instances[0].size, [8.0, 12.0]);
+        assert_eq!(batches.bg_instances[1].pos, [16.0, 20.0]);
+        assert_eq!(batches.bg_instances[1].size, [8.0, 12.0]);
+    }
+
+    #[test]
+    fn pane_visual_scroll_clips_gpu_instances_by_geometric_intersection() {
+        let mut batches = FrameTextBatches {
+            bg_instances: Vec::new(),
+            fg_instances: vec![CellInstance {
+                pos: [4.0, 16.0],
+                size: [16.0, 16.0],
+                uv_offset: [40.0, 80.0],
+                uv_size: [16.0, 16.0],
+                fg: [1.0; 4],
+                bg: [0.0; 4],
+                deco: [1.0; 4],
+                flags: FLAG_HAS_GLYPH,
+                _pad: [0; 2],
+            }],
+            overlay_instances: Vec::new(),
+        };
+        let mut images = vec![ImageInstance {
+            pos: [20.0, 16.0],
+            size: [16.0, 16.0],
+            uv_offset: [100.0, 200.0],
+            uv_size: [16.0, 16.0],
+        }];
+
+        apply_pane_visual_scroll(
+            &mut batches,
+            &mut images,
+            &[PaneVisualScroll {
+                kind: PaneKind::SidePanel,
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 1,
+                offset_rows: 0.0,
+            }],
+            8.0,
+            16.0,
+        );
+
+        assert_eq!(batches.fg_instances[0].pos, [8.0, 16.0]);
+        assert_eq!(batches.fg_instances[0].size, [12.0, 16.0]);
+        assert_eq!(batches.fg_instances[0].uv_offset, [44.0, 80.0]);
+        assert_eq!(batches.fg_instances[0].uv_size, [12.0, 16.0]);
+        assert_eq!(images[0].pos, [20.0, 16.0]);
+        assert_eq!(images[0].size, [4.0, 16.0]);
+        assert_eq!(images[0].uv_offset, [100.0, 200.0]);
+        assert_eq!(images[0].uv_size, [4.0, 16.0]);
     }
 
     #[test]

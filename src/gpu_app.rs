@@ -331,11 +331,14 @@ impl GpuApp {
         }
     }
 
-    fn current_pane_visual_scroll(state: &mut GpuWindowState) -> Option<PaneVisualScroll> {
-        let bridge = state.native_scroll.as_mut()?;
-        bridge
-            .visual_scroll(PaneKind::Chat)
-            .or_else(|| bridge.visual_scroll(PaneKind::SidePanel))
+    fn current_pane_visual_scrolls(state: &mut GpuWindowState) -> Vec<PaneVisualScroll> {
+        let Some(bridge) = state.native_scroll.as_mut() else {
+            return Vec::new();
+        };
+        [PaneKind::Chat, PaneKind::SidePanel]
+            .into_iter()
+            .filter_map(|pane| bridge.visual_scroll(pane))
+            .collect()
     }
 
     fn mouse_row_for_position(
@@ -1436,7 +1439,7 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
                             Self::sync_scrollback_view(state);
                         }
                         let viewport_scroll = Self::current_viewport_scroll(state, &self.config);
-                        let visual_scroll = Self::current_pane_visual_scroll(state);
+                        let visual_scrolls = Self::current_pane_visual_scrolls(state);
                         if !state.first_frame_logged {
                             let render_profile = render_surface_state_profiled_with_scroll(
                                 &mut state.renderer,
@@ -1444,7 +1447,7 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
                                 atlas,
                                 &self.config,
                                 viewport_scroll,
-                                visual_scroll,
+                                &visual_scrolls,
                             );
                             state.first_frame_logged = true;
                             // The initial window size was clamped on macOS to stop
@@ -1536,7 +1539,7 @@ impl ApplicationHandler<GpuAppEvent> for GpuApp {
                                 atlas,
                                 &self.config,
                                 viewport_scroll,
-                                visual_scroll,
+                                &visual_scrolls,
                             );
                             state.startup_timing.mark_present(Instant::now());
                             if state.startup_timing.emit_if_ready("gpu host", state.id)

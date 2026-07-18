@@ -190,7 +190,7 @@ pub struct GpuSurfaceState {
     pub last_visual_state: Option<VisualState>,
     pub last_presented_signature: Option<u64>,
     pub last_viewport_scroll_quantized: Option<u32>,
-    pub last_pane_scroll_quantized: Option<(PaneKind, u16, u16, u16, u16, i32)>,
+    pub last_pane_scroll_quantized: Vec<(PaneKind, u16, u16, u16, u16, i32)>,
     pub window: Arc<Window>,
     pub shared: Arc<SharedGpuContext>,
 }
@@ -878,7 +878,7 @@ pub fn create_surface_state_for_window_with_shared_profiled_with_defaults(
             last_visual_state: None,
             last_presented_signature: None,
             last_viewport_scroll_quantized: None,
-            last_pane_scroll_quantized: None,
+            last_pane_scroll_quantized: Vec::new(),
             window,
             shared,
         },
@@ -1005,7 +1005,7 @@ pub fn resume_surface_state(state: &mut GpuSurfaceState, transparency: bool) -> 
         .configure(&state.shared.device, &state.surface_config);
     state.last_presented_signature = None;
     state.last_viewport_scroll_quantized = None;
-    state.last_pane_scroll_quantized = None;
+    state.last_pane_scroll_quantized.clear();
     Ok(())
 }
 
@@ -1015,7 +1015,7 @@ pub fn render_surface_state_with_scroll(
     atlas: &mut GlyphAtlas,
     config: &AppConfig,
     scroll_rows: f32,
-    visual_scroll: Option<PaneVisualScroll>,
+    visual_scrolls: &[PaneVisualScroll],
 ) {
     let _ = render_surface_state_profiled_with_scroll(
         state,
@@ -1023,7 +1023,7 @@ pub fn render_surface_state_with_scroll(
         atlas,
         config,
         scroll_rows,
-        visual_scroll,
+        visual_scrolls,
     );
 }
 
@@ -1033,7 +1033,7 @@ pub fn render_surface_state_profiled_with_scroll(
     atlas: &mut GlyphAtlas,
     config: &AppConfig,
     scroll_rows: f32,
-    visual_scroll: Option<PaneVisualScroll>,
+    visual_scrolls: &[PaneVisualScroll],
 ) -> Option<GpuRenderProfile> {
     let total_start = Instant::now();
     let current_visual = VisualState::capture(terminal);
@@ -1042,16 +1042,19 @@ pub fn render_surface_state_profiled_with_scroll(
         ViewportScroll::from_scroll_state(terminal.grid().scroll_offset, scroll_rows);
     let effective_scroll_rows = viewport_scroll.scroll_rows();
     let viewport_quantized = (effective_scroll_rows * 1024.0).round() as u32;
-    let pane_scroll_quantized = visual_scroll.map(|scroll| {
-        (
-            scroll.kind,
-            scroll.x,
-            scroll.y,
-            scroll.width,
-            scroll.height,
-            (scroll.offset_rows * 1024.0).round() as i32,
-        )
-    });
+    let pane_scroll_quantized: Vec<_> = visual_scrolls
+        .iter()
+        .map(|scroll| {
+            (
+                scroll.kind,
+                scroll.x,
+                scroll.y,
+                scroll.width,
+                scroll.height,
+                (scroll.offset_rows * 1024.0).round() as i32,
+            )
+        })
+        .collect();
     if state.last_presented_signature == Some(signature)
         && state.last_viewport_scroll_quantized == Some(viewport_quantized)
         && state.last_pane_scroll_quantized == pane_scroll_quantized
@@ -1070,7 +1073,7 @@ pub fn render_surface_state_profiled_with_scroll(
                 .configure(&state.shared.device, &state.surface_config);
             state.last_presented_signature = None;
             state.last_viewport_scroll_quantized = None;
-            state.last_pane_scroll_quantized = None;
+            state.last_pane_scroll_quantized.clear();
             return None;
         }
         Err(_) => return None,
@@ -1233,7 +1236,7 @@ pub fn render_surface_state_profiled_with_scroll(
     apply_pane_visual_scroll(
         &mut text_batches,
         &mut image_instances,
-        visual_scroll,
+        visual_scrolls,
         cell_w,
         cell_h,
     );

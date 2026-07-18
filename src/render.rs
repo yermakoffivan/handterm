@@ -421,7 +421,15 @@ pub fn render_terminal_to_buffer_with_visual_scrolls(
 
     let base_bg = config.style.background.as_u32_rgb();
     for scroll in visual_scrolls {
-        apply_pane_visual_scroll(buffer, buf_w, buf_h, atlas.cell_height, *scroll, base_bg);
+        apply_pane_visual_scroll(
+            buffer,
+            buf_w,
+            buf_h,
+            atlas.cell_width,
+            atlas.cell_height,
+            *scroll,
+            base_bg,
+        );
     }
 }
 
@@ -430,17 +438,25 @@ pub(crate) fn apply_pane_visual_scroll(
     buffer: &mut [u32],
     buf_w: usize,
     buf_h: usize,
+    cell_w: usize,
     cell_h: usize,
     scroll: PaneVisualScroll,
     fill: u32,
 ) {
-    if buf_w == 0 || buf_h == 0 || cell_h == 0 || buffer.len() < buf_w.saturating_mul(buf_h) {
+    if buf_w == 0
+        || buf_h == 0
+        || cell_w == 0
+        || cell_h == 0
+        || buffer.len() < buf_w.saturating_mul(buf_h)
+    {
         return;
     }
 
-    let x0 = usize::from(scroll.x).min(buf_w);
+    let x0 = usize::from(scroll.x).saturating_mul(cell_w).min(buf_w);
     let y0 = usize::from(scroll.y).saturating_mul(cell_h).min(buf_h);
-    let x1 = x0.saturating_add(usize::from(scroll.width)).min(buf_w);
+    let x1 = x0
+        .saturating_add(usize::from(scroll.width).saturating_mul(cell_w))
+        .min(buf_w);
     let y1 = y0
         .saturating_add(usize::from(scroll.height).saturating_mul(cell_h))
         .min(buf_h);
@@ -863,6 +879,7 @@ mod tests {
             &mut pixels,
             buf_w,
             buf_h,
+            1,
             2,
             pane_scroll(1, 1, 2, 2, 0.5),
             0,
@@ -897,6 +914,7 @@ mod tests {
             &mut pixels,
             buf_w,
             buf_h,
+            1,
             4,
             pane_scroll(0, 0, 3, 1, 0.12),
             0,
@@ -910,6 +928,7 @@ mod tests {
             &mut pixels,
             buf_w,
             buf_h,
+            1,
             4,
             pane_scroll(0, 0, 3, 1, 0.13),
             0,
@@ -918,6 +937,43 @@ mod tests {
             pixels, original,
             "fractional offsets that reach a pixel must move pane pixels"
         );
+    }
+
+    #[cfg(feature = "standalone")]
+    #[test]
+    fn pane_visual_scroll_converts_pane_x_and_width_cells_to_pixels() {
+        let buf_w = 12;
+        let buf_h = 4;
+        let cell_w = 3;
+        let cell_h = 2;
+        let mut pixels: Vec<u32> = (0..buf_w * buf_h).map(|idx| idx as u32 + 1).collect();
+        let original = pixels.clone();
+
+        apply_pane_visual_scroll(
+            &mut pixels,
+            buf_w,
+            buf_h,
+            cell_w,
+            cell_h,
+            pane_scroll(1, 0, 2, 1, 0.5),
+            0,
+        );
+
+        for y in 0..buf_h {
+            for x in 0..buf_w {
+                let idx = y * buf_w + x;
+                if (3..9).contains(&x) && y == 0 {
+                    assert_eq!(pixels[idx], original[buf_w + x]);
+                } else if (3..9).contains(&x) && y == 1 {
+                    assert_eq!(pixels[idx], 0);
+                } else {
+                    assert_eq!(
+                        pixels[idx], original[idx],
+                        "pixel outside pane changed at {x},{y}"
+                    );
+                }
+            }
+        }
     }
 
     fn extract_cell_pixels(
