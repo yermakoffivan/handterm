@@ -16,11 +16,11 @@ use crate::host_input::{
     SyntheticInputTarget, apply_synthetic_ime_commit, apply_synthetic_key_event,
 };
 use crate::ipc::{IpcAction, IpcServer, Request, Response};
-use crate::native_scroll::{NativeScrollBridge, child_process_envs};
+use crate::native_scroll::{NativeScrollBridge, PaneKind, PaneVisualScroll, child_process_envs};
 use crate::platform::{copy_to_clipboard, open_url, paste_from_clipboard};
 use crate::profiling::{ProcessCpuTime, emit_structured_profile_event};
 use crate::pty::PtyChild;
-use crate::render::render_terminal_to_buffer;
+use crate::render::render_terminal_to_buffer_with_visual_scrolls;
 use crate::standalone_support::handle_ipc_request;
 use crate::terminal::Terminal;
 use anyhow::{Context, Result};
@@ -1327,7 +1327,8 @@ fn render_grid(
         state.last_presented_signature = None;
     }
 
-    let signature = visual_signature(&state.terminal);
+    let visual_scrolls = active_visual_scrolls(state);
+    let signature = visual_signature_with_pane_scrolls(&state.terminal, &visual_scrolls);
     if state.last_presented_signature == Some(signature) {
         state.terminal.grid.clear_dirty();
         return Ok(());
@@ -1337,7 +1338,7 @@ fn render_grid(
         .surface
         .buffer_mut()
         .map_err(|e| anyhow::anyhow!("failed to acquire backbuffer: {e}"))?;
-    render_terminal_to_buffer(
+    render_terminal_to_buffer_with_visual_scrolls(
         buffer.as_mut(),
         width.get() as usize,
         height.get() as usize,
@@ -1345,6 +1346,7 @@ fn render_grid(
         atlas,
         config,
         &mut state.last_visual_state,
+        &visual_scrolls,
     );
 
     buffer
@@ -1354,9 +1356,45 @@ fn render_grid(
     Ok(())
 }
 
+fn active_visual_scrolls(state: &mut HostWindowState) -> Vec<PaneVisualScroll> {
+    let Some(native_scroll) = state.native_scroll.as_mut() else {
+        return Vec::new();
+    };
+    [PaneKind::Chat, PaneKind::SidePanel]
+        .into_iter()
+        .filter_map(|pane| native_scroll.visual_scroll(pane))
+        .collect()
+}
+
+fn visual_signature_with_pane_scrolls(
+    terminal: &Terminal,
+    visual_scrolls: &[PaneVisualScroll],
+) -> u64 {
+    const FNV_PRIME: u64 = 0x100000001b3;
+    #[inline]
+    fn mix(hash: &mut u64, value: u64) {
+        *hash ^= value;
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    let mut hash = visual_signature(terminal);
+    mix(&mut hash, visual_scrolls.len() as u64);
+    for scroll in visual_scrolls {
+        mix(&mut hash, scroll.kind as u64);
+        mix(&mut hash, scroll.x as u64);
+        mix(&mut hash, scroll.y as u64);
+        mix(&mut hash, scroll.width as u64);
+        mix(&mut hash, scroll.height as u64);
+        mix(&mut hash, scroll.offset_rows.to_bits() as u64);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod event_loop_tests {
-    use super::earlier_deadline;
+    use super::{earlier_deadline, visual_signature_with_pane_scrolls};
+    use crate::native_scroll::{PaneKind, PaneVisualScroll};
+    use crate::terminal::Terminal;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1366,5 +1404,32 @@ mod event_loop_tests {
         let ipc = now + Duration::from_millis(16);
         assert_eq!(earlier_deadline(Some(frame), ipc), Some(frame));
         assert_eq!(earlier_deadline(None, ipc), Some(ipc));
+    }
+
+    #[test]
+    fn pane_visual_scroll_fraction_changes_cpu_present_signature() {
+        let terminal = Terminal::new(4, 2);
+        let base = visual_signature_with_pane_scrolls(&terminal, &[]);
+        let tiny_scroll = [PaneVisualScroll {
+            kind: PaneKind::Chat,
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 1,
+            offset_rows: 0.125,
+        }];
+        let larger_scroll = [PaneVisualScroll {
+            offset_rows: 0.25,
+            ..tiny_scroll[0]
+        }];
+
+        assert_ne!(
+            base,
+            visual_signature_with_pane_scrolls(&terminal, &tiny_scroll)
+        );
+        assert_ne!(
+            visual_signature_with_pane_scrolls(&terminal, &tiny_scroll),
+            visual_signature_with_pane_scrolls(&terminal, &larger_scroll)
+        );
     }
 }

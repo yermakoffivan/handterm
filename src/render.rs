@@ -4,6 +4,8 @@ use crate::font::GlyphAtlas;
 use crate::frontend::{VisualState, compute_scrollbar_geometry, sync_visual_damage};
 use crate::grid::{COLOR_DEFAULT, Cell};
 use crate::kitty_placeholders::{fill_kitty_virtual_cells, is_kitty_unicode_placeholder};
+#[cfg(feature = "standalone")]
+use crate::native_scroll::PaneVisualScroll;
 use crate::terminal::{CursorStyle, TerminalView};
 use crate::visual::{is_in_selection, resolve_cell_colors, resolve_underline_color};
 
@@ -396,6 +398,92 @@ pub fn render_terminal_to_buffer(
     *last_visual_state = Some(current_visual);
 }
 
+#[cfg(feature = "standalone")]
+pub fn render_terminal_to_buffer_with_visual_scrolls(
+    buffer: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    terminal: &mut impl TerminalView,
+    atlas: &mut GlyphAtlas,
+    config: &AppConfig,
+    last_visual_state: &mut Option<VisualState>,
+    visual_scrolls: &[PaneVisualScroll],
+) {
+    render_terminal_to_buffer(
+        buffer,
+        buf_w,
+        buf_h,
+        terminal,
+        atlas,
+        config,
+        last_visual_state,
+    );
+
+    let base_bg = config.style.background.as_u32_rgb();
+    for scroll in visual_scrolls {
+        apply_pane_visual_scroll(buffer, buf_w, buf_h, atlas.cell_height, *scroll, base_bg);
+    }
+}
+
+#[cfg(feature = "standalone")]
+pub(crate) fn apply_pane_visual_scroll(
+    buffer: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    cell_h: usize,
+    scroll: PaneVisualScroll,
+    fill: u32,
+) {
+    if buf_w == 0 || buf_h == 0 || cell_h == 0 || buffer.len() < buf_w.saturating_mul(buf_h) {
+        return;
+    }
+
+    let x0 = usize::from(scroll.x).min(buf_w);
+    let y0 = usize::from(scroll.y).saturating_mul(cell_h).min(buf_h);
+    let x1 = x0.saturating_add(usize::from(scroll.width)).min(buf_w);
+    let y1 = y0
+        .saturating_add(usize::from(scroll.height).saturating_mul(cell_h))
+        .min(buf_h);
+    if x0 >= x1 || y0 >= y1 || !scroll.offset_rows.is_finite() {
+        return;
+    }
+
+    let offset_px = (scroll.offset_rows * cell_h as f32).round() as isize;
+    if offset_px == 0 {
+        return;
+    }
+    let dy = -offset_px;
+    let rect_h = y1 - y0;
+    if dy.unsigned_abs() >= rect_h {
+        for y in y0..y1 {
+            buffer[y * buf_w + x0..y * buf_w + x1].fill(fill);
+        }
+        return;
+    }
+
+    if dy < 0 {
+        let shift = (-dy) as usize;
+        for y in y0..(y1 - shift) {
+            let src_start = (y + shift) * buf_w + x0;
+            let dst_start = y * buf_w + x0;
+            buffer.copy_within(src_start..src_start + (x1 - x0), dst_start);
+        }
+        for y in (y1 - shift)..y1 {
+            buffer[y * buf_w + x0..y * buf_w + x1].fill(fill);
+        }
+    } else {
+        let shift = dy as usize;
+        for y in (y0 + shift..y1).rev() {
+            let src_start = (y - shift) * buf_w + x0;
+            let dst_start = y * buf_w + x0;
+            buffer.copy_within(src_start..src_start + (x1 - x0), dst_start);
+        }
+        for y in y0..(y0 + shift) {
+            buffer[y * buf_w + x0..y * buf_w + x1].fill(fill);
+        }
+    }
+}
+
 fn draw_scrollback_scrollbar(
     buffer: &mut [u32],
     buf_w: usize,
@@ -731,6 +819,8 @@ fn blend_rgba(pixel: &mut u32, rgba: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "standalone")]
+    use crate::native_scroll::{PaneKind, PaneVisualScroll};
     use crate::terminal::Terminal;
     use crate::workloads::{
         EMOJI_AND_SHADE_TRANSCRIPT, FISH_STARTUP_TRANSCRIPT, STARSHIP_PROMPT_TRANSCRIPT,
@@ -747,6 +837,87 @@ mod tests {
         GlyphAtlas::with_family_dpi(&config.style.font_family, config.style.font_size, dpi)
             .or_else(|_| GlyphAtlas::new_with_dpi(config.style.font_size, dpi))
             .expect("should load a monospace font atlas for requested dpi")
+    }
+
+    #[cfg(feature = "standalone")]
+    fn pane_scroll(x: u16, y: u16, width: u16, height: u16, offset_rows: f32) -> PaneVisualScroll {
+        PaneVisualScroll {
+            kind: PaneKind::Chat,
+            x,
+            y,
+            width,
+            height,
+            offset_rows,
+        }
+    }
+
+    #[cfg(feature = "standalone")]
+    #[test]
+    fn pane_visual_scroll_translates_only_inside_clipped_pane() {
+        let buf_w = 5;
+        let buf_h = 6;
+        let mut pixels: Vec<u32> = (0..buf_w * buf_h).map(|idx| idx as u32 + 1).collect();
+        let original = pixels.clone();
+
+        apply_pane_visual_scroll(
+            &mut pixels,
+            buf_w,
+            buf_h,
+            2,
+            pane_scroll(1, 1, 2, 2, 0.5),
+            0,
+        );
+
+        for y in 0..buf_h {
+            for x in 0..buf_w {
+                let idx = y * buf_w + x;
+                if (1..3).contains(&x) && (2..5).contains(&y) {
+                    assert_eq!(pixels[idx], original[(y + 1) * buf_w + x]);
+                } else if (1..3).contains(&x) && y == 5 {
+                    assert_eq!(pixels[idx], 0);
+                } else {
+                    assert_eq!(
+                        pixels[idx], original[idx],
+                        "pixel outside pane changed at {x},{y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "standalone")]
+    #[test]
+    fn pane_visual_scroll_preserves_subpixel_deltas_until_visible() {
+        let buf_w = 3;
+        let buf_h = 4;
+        let original: Vec<u32> = (0..buf_w * buf_h).map(|idx| idx as u32 + 1).collect();
+        let mut pixels = original.clone();
+
+        apply_pane_visual_scroll(
+            &mut pixels,
+            buf_w,
+            buf_h,
+            4,
+            pane_scroll(0, 0, 3, 1, 0.12),
+            0,
+        );
+        assert_eq!(
+            pixels, original,
+            "subpixel offsets are retained by bridge state, not rounded into movement here"
+        );
+
+        apply_pane_visual_scroll(
+            &mut pixels,
+            buf_w,
+            buf_h,
+            4,
+            pane_scroll(0, 0, 3, 1, 0.13),
+            0,
+        );
+        assert_ne!(
+            pixels, original,
+            "fractional offsets that reach a pixel must move pane pixels"
+        );
     }
 
     fn extract_cell_pixels(
