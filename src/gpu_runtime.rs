@@ -8,7 +8,7 @@ use crate::gpu_frame::{
     fill_image_instances_with_history, fill_text_batches,
 };
 use crate::kitty_placeholders::fill_kitty_virtual_cells;
-use crate::native_scroll::PaneVisualScroll;
+use crate::native_scroll::{PaneKind, PaneVisualScroll};
 use crate::terminal::TerminalView;
 use anyhow::{Context, Result};
 use handterm_common::graphics::KittyImage;
@@ -190,6 +190,7 @@ pub struct GpuSurfaceState {
     pub last_visual_state: Option<VisualState>,
     pub last_presented_signature: Option<u64>,
     pub last_viewport_scroll_quantized: Option<u32>,
+    pub last_pane_scroll_quantized: Option<(PaneKind, u16, u16, u16, u16, i32)>,
     pub window: Arc<Window>,
     pub shared: Arc<SharedGpuContext>,
 }
@@ -877,6 +878,7 @@ pub fn create_surface_state_for_window_with_shared_profiled_with_defaults(
             last_visual_state: None,
             last_presented_signature: None,
             last_viewport_scroll_quantized: None,
+            last_pane_scroll_quantized: None,
             window,
             shared,
         },
@@ -1003,6 +1005,7 @@ pub fn resume_surface_state(state: &mut GpuSurfaceState, transparency: bool) -> 
         .configure(&state.shared.device, &state.surface_config);
     state.last_presented_signature = None;
     state.last_viewport_scroll_quantized = None;
+    state.last_pane_scroll_quantized = None;
     Ok(())
 }
 
@@ -1039,9 +1042,19 @@ pub fn render_surface_state_profiled_with_scroll(
         ViewportScroll::from_scroll_state(terminal.grid().scroll_offset, scroll_rows);
     let effective_scroll_rows = viewport_scroll.scroll_rows();
     let viewport_quantized = (effective_scroll_rows * 1024.0).round() as u32;
+    let pane_scroll_quantized = visual_scroll.map(|scroll| {
+        (
+            scroll.kind,
+            scroll.x,
+            scroll.y,
+            scroll.width,
+            scroll.height,
+            (scroll.offset_rows * 1024.0).round() as i32,
+        )
+    });
     if state.last_presented_signature == Some(signature)
         && state.last_viewport_scroll_quantized == Some(viewport_quantized)
-        && visual_scroll.is_none()
+        && state.last_pane_scroll_quantized == pane_scroll_quantized
     {
         terminal.grid_mut().clear_dirty();
         state.last_visual_state = Some(current_visual);
@@ -1057,6 +1070,7 @@ pub fn render_surface_state_profiled_with_scroll(
                 .configure(&state.shared.device, &state.surface_config);
             state.last_presented_signature = None;
             state.last_viewport_scroll_quantized = None;
+            state.last_pane_scroll_quantized = None;
             return None;
         }
         Err(_) => return None,
@@ -1344,6 +1358,7 @@ pub fn render_surface_state_profiled_with_scroll(
     state.last_visual_state = Some(current_visual);
     state.last_presented_signature = Some(signature);
     state.last_viewport_scroll_quantized = Some(viewport_quantized);
+    state.last_pane_scroll_quantized = pane_scroll_quantized;
 
     Some(GpuRenderProfile {
         acquire_surface,

@@ -1079,23 +1079,21 @@ impl ApplicationHandler<AppEvent> for HandtermApp {
                         }
                     }
                     WindowEvent::MouseWheel { delta, .. } => {
-                        let (up, lines) = match delta {
-                            MouseScrollDelta::LineDelta(_, y) => {
-                                (y > 0.0, y.abs().max(1.0) as usize)
-                            }
+                        let (up, delta_rows) = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => (y > 0.0, y.abs()),
                             MouseScrollDelta::PixelDelta(pos) => {
                                 let ch = cell_height as f64;
-                                (pos.y > 0.0, (pos.y.abs() / ch).max(1.0) as usize)
+                                (pos.y > 0.0, (pos.y.abs() / ch) as f32)
                             }
                         };
+                        let lines = delta_rows.ceil().max(1.0) as usize;
                         if let Some(bridge) = state.native_scroll.as_mut()
                             && let Some(pane) =
                                 bridge.hovered_pane(state.mouse_col, state.mouse_row)
-                            && bridge.send_scroll_delta(
-                                pane,
-                                if up { -(lines as f32) } else { lines as f32 },
-                            )
+                            && bridge
+                                .send_scroll_delta(pane, if up { -delta_rows } else { delta_rows })
                         {
+                            state.scheduler.mark_redraw_needed();
                             return;
                         }
                         if state.terminal.mouse_mode != crate::terminal::MouseMode::Off {

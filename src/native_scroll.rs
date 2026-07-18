@@ -73,6 +73,26 @@ pub enum HostToApp {
     Scroll { pane: PaneKind, delta: i32 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PaneVisualScroll {
+    pub kind: PaneKind,
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    /// Pending visual motion relative to the latest Jcode pane snapshot.
+    /// Positive values mean scrolling toward later content, so rendered pane
+    /// pixels move upward.
+    pub offset_rows: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PaneMotion {
+    offset_rows: f32,
+    outstanding_rows: i32,
+    last_position: Option<usize>,
+}
+
 #[derive(Debug)]
 pub struct NativeScrollBridge {
     socket_path: PathBuf,
@@ -83,8 +103,8 @@ pub struct NativeScrollBridge {
     observed_connection_generation: u64,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    chat_residual: f32,
-    side_panel_residual: f32,
+    chat_motion: PaneMotion,
+    side_panel_motion: PaneMotion,
 }
 
 impl NativeScrollBridge {
@@ -128,8 +148,8 @@ impl NativeScrollBridge {
             observed_connection_generation: 0,
             stop,
             thread: Some(thread),
-            chat_residual: 0.0,
-            side_panel_residual: 0.0,
+            chat_motion: PaneMotion::default(),
+            side_panel_motion: PaneMotion::default(),
         })
     }
 
@@ -145,32 +165,115 @@ impl NativeScrollBridge {
         self.snapshot.lock().ok()?.hovered_pane(col, row)
     }
 
+    fn motion_mut(&mut self, pane: PaneKind) -> &mut PaneMotion {
+        match pane {
+            PaneKind::Chat => &mut self.chat_motion,
+            PaneKind::SidePanel => &mut self.side_panel_motion,
+        }
+    }
+
+    fn pane_state(&self, pane: PaneKind) -> Option<PaneState> {
+        self.snapshot
+            .lock()
+            .ok()?
+            .panes
+            .iter()
+            .find(|state| state.kind == pane)
+            .cloned()
+    }
+
+    fn reset_motion(&mut self) {
+        self.chat_motion = PaneMotion::default();
+        self.side_panel_motion = PaneMotion::default();
+    }
+
+    fn sync_connection_generation(&mut self) {
+        let generation = self.connection_generation.load(Ordering::Relaxed);
+        if generation != self.observed_connection_generation {
+            self.observed_connection_generation = generation;
+            self.reset_motion();
+        }
+    }
+
+    fn reconcile_motion(&mut self, pane: PaneKind, state: &PaneState) {
+        let motion = self.motion_mut(pane);
+        if let Some(previous) = motion.last_position {
+            let acknowledged = if state.position >= previous {
+                i32::try_from(state.position - previous).unwrap_or(i32::MAX)
+            } else {
+                -i32::try_from(previous - state.position).unwrap_or(i32::MAX)
+            };
+            if acknowledged != 0 {
+                motion.offset_rows -= acknowledged as f32;
+                motion.outstanding_rows = motion.outstanding_rows.saturating_sub(acknowledged);
+            }
+        }
+        motion.last_position = Some(state.position);
+
+        let max_position = state.content_length.saturating_sub(state.viewport_length);
+        let min_offset = -(state.position as f32);
+        let max_offset = max_position.saturating_sub(state.position) as f32;
+        motion.offset_rows = motion.offset_rows.clamp(min_offset, max_offset);
+        if motion.offset_rows.abs() < 0.0001 {
+            motion.offset_rows = 0.0;
+        }
+    }
+
+    pub fn visual_scroll(&mut self, pane: PaneKind) -> Option<PaneVisualScroll> {
+        self.sync_connection_generation();
+        let state = self.pane_state(pane)?;
+        self.reconcile_motion(pane, &state);
+        let offset_rows = self.motion_mut(pane).offset_rows;
+        (offset_rows != 0.0).then_some(PaneVisualScroll {
+            kind: pane,
+            x: state.x,
+            y: state.y,
+            width: state.width,
+            height: state.height,
+            offset_rows,
+        })
+    }
+
     pub fn send_scroll_delta(&mut self, pane: PaneKind, delta_rows: f32) -> bool {
         if !self.connected.load(Ordering::Acquire) {
             return false;
         }
 
-        let generation = self.connection_generation.load(Ordering::Relaxed);
-        if generation != self.observed_connection_generation {
-            self.observed_connection_generation = generation;
-            self.chat_residual = 0.0;
-            self.side_panel_residual = 0.0;
+        if !delta_rows.is_finite() {
+            return true;
         }
-
-        let residual = match pane {
-            PaneKind::Chat => &mut self.chat_residual,
-            PaneKind::SidePanel => &mut self.side_panel_residual,
+        self.sync_connection_generation();
+        let Some(state) = self.pane_state(pane) else {
+            return false;
         };
+        self.reconcile_motion(pane, &state);
 
-        let steps = accumulate_scroll_steps(residual, delta_rows);
-
+        let max_position = state.content_length.saturating_sub(state.viewport_length);
+        let min_offset = -(state.position as f32);
+        let max_offset = max_position.saturating_sub(state.position) as f32;
+        let steps = {
+            let motion = self.motion_mut(pane);
+            motion.offset_rows = (motion.offset_rows + delta_rows).clamp(min_offset, max_offset);
+            let desired_rows = motion
+                .offset_rows
+                .trunc()
+                .clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+            desired_rows.saturating_sub(motion.outstanding_rows)
+        };
         if steps == 0 {
             return true;
         }
-
-        self.command_tx
+        if self
+            .command_tx
             .send(HostToApp::Scroll { pane, delta: steps })
             .is_ok()
+        {
+            let motion = self.motion_mut(pane);
+            motion.outstanding_rows = motion.outstanding_rows.saturating_add(steps);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -201,6 +304,7 @@ pub(crate) fn child_process_envs(
 /// slower for large deltas and could spin forever on a non-finite delta; this
 /// form treats any non-finite accumulation as "no movement" and resets the
 /// residual so a stray NaN/inf cannot poison later events.
+#[cfg(test)]
 fn accumulate_scroll_steps(residual: &mut f32, delta_rows: f32) -> i32 {
     let total = *residual + delta_rows;
     if !total.is_finite() {
@@ -407,6 +511,21 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    fn install_scrollable_chat_snapshot(bridge: &NativeScrollBridge, position: usize) {
+        *bridge.snapshot.lock().expect("snapshot lock") = PaneSnapshot {
+            panes: vec![PaneState {
+                kind: PaneKind::Chat,
+                x: 2,
+                y: 3,
+                width: 10,
+                height: 4,
+                position,
+                content_length: 20,
+                viewport_length: 4,
+            }],
+        };
+    }
+
     #[test]
     fn accumulate_scroll_steps_matches_reference_loop() {
         // Reference implementation: the previous loop-based behavior.
@@ -508,11 +627,23 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(bridge.connected.load(Ordering::Relaxed));
+        install_scrollable_chat_snapshot(&bridge, 0);
 
         let _ = bridge.send_scroll_delta(PaneKind::Chat, 0.4);
-        assert!((bridge.chat_residual - 0.4).abs() < f32::EPSILON);
+        assert!((bridge.chat_motion.offset_rows - 0.4).abs() < f32::EPSILON);
+        assert_eq!(bridge.chat_motion.outstanding_rows, 0);
         let _ = bridge.send_scroll_delta(PaneKind::Chat, 0.7);
-        assert!(bridge.chat_residual >= 0.0 && bridge.chat_residual < 1.0);
+        assert!((bridge.chat_motion.offset_rows - 1.1).abs() < 1e-5);
+        assert_eq!(bridge.chat_motion.outstanding_rows, 1);
+        let visual = bridge.visual_scroll(PaneKind::Chat).expect("visual motion");
+        assert!((visual.offset_rows - 1.1).abs() < 1e-5);
+
+        install_scrollable_chat_snapshot(&bridge, 1);
+        let visual = bridge
+            .visual_scroll(PaneKind::Chat)
+            .expect("fractional remainder remains after acknowledgement");
+        assert!((visual.offset_rows - 0.1).abs() < 1e-5);
+        assert_eq!(bridge.chat_motion.outstanding_rows, 0);
     }
 
     #[test]
@@ -520,7 +651,7 @@ mod tests {
         let mut bridge = NativeScrollBridge::new(999_993).expect("bridge should initialize");
         assert!(!bridge.connected.load(Ordering::Relaxed));
         assert!(!bridge.send_scroll_delta(PaneKind::Chat, 1.0));
-        assert_eq!(bridge.chat_residual, 0.0);
+        assert_eq!(bridge.chat_motion.offset_rows, 0.0);
     }
 
     #[test]
@@ -539,7 +670,7 @@ mod tests {
                 delta: 7,
             })
             .expect("stale command should queue before connection");
-        bridge.chat_residual = 0.75;
+        bridge.chat_motion.offset_rows = 0.75;
 
         let mut stream = UnixStream::connect(socket_path).expect("client should connect");
         stream
@@ -550,9 +681,10 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(bridge.connected.load(Ordering::Acquire));
+        install_scrollable_chat_snapshot(&bridge, 0);
 
         assert!(bridge.send_scroll_delta(PaneKind::Chat, 0.25));
-        assert!((bridge.chat_residual - 0.25).abs() < f32::EPSILON);
+        assert!((bridge.chat_motion.offset_rows - 0.25).abs() < f32::EPSILON);
 
         let mut byte = [0u8; 1];
         let error = stream
