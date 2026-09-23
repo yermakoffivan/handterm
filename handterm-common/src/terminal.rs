@@ -1,9 +1,15 @@
 use crate::control_strings::{
     ApcEvent, ControlStringEvent, ControlStringState, DcsEvent, OscEvent, SixelEvent,
 };
-pub use crate::graphics::{KittyGraphicsCommand, KittyImage, KittyImageFinalize, KittyPlacement};
-use crate::graphics::{KittyUploadState, decode_kitty_image_payload};
+pub use crate::graphics::{
+    KittyGraphicsCommand, KittyImage, KittyImageFinalize, KittyPlacement, KittyViewportPlacements,
+};
+use crate::graphics::{
+    KittyUploadState, MAX_KITTY_IMAGE_STORAGE_BYTES, MAX_KITTY_IMAGES, MAX_KITTY_PAYLOAD_BYTES,
+    MAX_KITTY_PLACEMENTS, decode_kitty_image_payload,
+};
 use crate::grid::Grid;
+use crate::latex::{LATEX_APC_PREFIX, LatexLayout, render_latex};
 use crate::parser::{Action, Parser};
 use crate::protocol::{CursorState, DirtyCell, ServerMessage, WindowModes};
 use crate::server_sync::{
@@ -38,9 +44,12 @@ pub struct Terminal {
     pub cols: u16,
     pub rows: u16,
     pub cursor_visible: bool,
+    cursor_blink_visible: bool,
     pub title: Option<String>,
     control_strings: ControlStringState,
     response_buf: Vec<u8>,
+    default_foreground: [u8; 3],
+    default_background: [u8; 3],
     saved_cursor: Option<(usize, usize)>,
     mode_bracketed_paste: bool,
     mode_focus_events: bool,
@@ -60,6 +69,7 @@ pub struct Terminal {
     saved_main_kitty_placements: Option<Vec<KittyPlacement>>,
     kitty_upload: KittyUploadState,
     kitty_generation: u64,
+    kitty_image_generation: u64,
     kitty_keyboard_main_flags: u8,
     kitty_keyboard_alt_flags: u8,
     kitty_keyboard_main_stack: Vec<u8>,
@@ -103,7 +113,18 @@ pub trait TerminalView {
     fn cursor_visible(&self) -> bool;
     fn cursor_style(&self) -> CursorStyle;
     fn kitty_generation(&self) -> u64;
+    /// Raw live-relative anchors, including negative rows in retained history.
     fn kitty_placements(&self) -> &[KittyPlacement];
+    fn kitty_image_generation(&self) -> u64 {
+        self.kitty_generation()
+    }
+    fn kitty_viewport_placements(&self) -> KittyViewportPlacements<'_> {
+        self.kitty_viewport_placements_at_scroll(self.grid().scroll_offset)
+    }
+    /// Explicit sample offset for renderers that apply fractional pixel scrolling.
+    fn kitty_viewport_placements_at_scroll(&self, offset: usize) -> KittyViewportPlacements<'_> {
+        KittyViewportPlacements::new(self.kitty_placements(), offset)
+    }
     fn kitty_image(&self, id: u32) -> Option<&KittyImage>;
     fn content_generation(&self) -> u64 {
         self.grid().generation()
@@ -134,7 +155,7 @@ impl TerminalView for Terminal {
     }
 
     fn cursor_visible(&self) -> bool {
-        self.cursor_visible
+        self.cursor_visible && self.cursor_blink_visible
     }
 
     fn cursor_style(&self) -> CursorStyle {
@@ -145,8 +166,12 @@ impl TerminalView for Terminal {
         self.kitty_generation
     }
 
+    fn kitty_image_generation(&self) -> u64 {
+        self.kitty_image_generation
+    }
+
     fn kitty_placements(&self) -> &[KittyPlacement] {
-        &self.kitty_placements
+        self.kitty_placements()
     }
 
     fn kitty_image(&self, id: u32) -> Option<&KittyImage> {
@@ -174,9 +199,12 @@ impl Terminal {
             cols,
             rows,
             cursor_visible: true,
+            cursor_blink_visible: true,
             title: None,
             control_strings: ControlStringState::default(),
             response_buf: Vec::new(),
+            default_foreground: [0xcd, 0xd6, 0xf4],
+            default_background: [0x00, 0x00, 0x00],
             saved_cursor: None,
             mode_bracketed_paste: false,
             mode_focus_events: false,
@@ -196,6 +224,7 @@ impl Terminal {
             saved_main_kitty_placements: None,
             kitty_upload: KittyUploadState::default(),
             kitty_generation: 0,
+            kitty_image_generation: 0,
             kitty_keyboard_main_flags: 0,
             kitty_keyboard_alt_flags: 0,
             kitty_keyboard_main_stack: Vec::with_capacity(8),
@@ -222,13 +251,51 @@ impl Terminal {
         self.mode_synchronized_update = false;
     }
 
+    /// Set the embedder's default RGB colors reported by OSC 10/11 queries.
+    ///
+    /// Defaults are foreground `#cdd6f4` and background `#000000`. These settings
+    /// survive terminal resets (RIS) and can be updated when the theme changes.
+    /// Cells retain their default-color markers; the embedder must use the same
+    /// colors when rendering them. Explicit SGR colors are not changed.
+    pub fn set_default_colors(&mut self, foreground: [u8; 3], background: [u8; 3]) {
+        self.default_foreground = foreground;
+        self.default_background = background;
+    }
+
+    /// Set the frontend-controlled blink phase without changing the terminal's
+    /// DECTCEM cursor visibility mode. Returns whether the rendered cursor
+    /// visibility changed.
+    pub fn set_cursor_blink_visible(&mut self, visible: bool) -> bool {
+        let was_visible = self.cursor_visible && self.cursor_blink_visible;
+        self.cursor_blink_visible = visible;
+        was_visible != (self.cursor_visible && self.cursor_blink_visible)
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.cols = cols;
-        self.rows = rows;
+        self.sync_kitty_scroll();
+        self.cols = cols.max(1);
+        self.rows = rows.max(1);
         self.grid.resize(cols, rows);
-        if let Some(ref mut alt) = self.alt_grid {
-            alt.resize(cols, rows);
+        self.sync_kitty_scroll();
+        let mut evicted_images = Vec::new();
+        if let Some(ref mut main) = self.alt_grid {
+            main.resize(cols, rows);
+            if main.take_scroll_damage().is_some() {
+                if let Some(saved) = &mut self.saved_main_kitty_placements {
+                    saved.retain(|placement| {
+                        let keep = Self::placement_in_grid(placement, main);
+                        if !keep {
+                            evicted_images.push(placement.image_id);
+                        }
+                        keep
+                    });
+                    if !evicted_images.is_empty() {
+                        self.kitty_generation = self.kitty_generation.wrapping_add(1);
+                    }
+                }
+            }
         }
+        self.reclaim_evicted_kitty_images(evicted_images);
     }
 
     pub fn drain_responses(&mut self) -> Option<Vec<u8>> {
@@ -367,7 +434,17 @@ impl Terminal {
                 placements,
                 ..
             } => {
-                self.kitty_images = kitty_images_from_wire(images);
+                let images_changed = self.kitty_images.len() != images.len()
+                    || self.kitty_images.iter().zip(images).any(|(old, new)| {
+                        old.id != new.id
+                            || old.width != new.width
+                            || old.height != new.height
+                            || old.data != new.data
+                    });
+                if images_changed {
+                    self.kitty_images = kitty_images_from_wire(images);
+                    self.kitty_image_generation = self.kitty_image_generation.wrapping_add(1);
+                }
                 self.kitty_placements = kitty_placements_from_wire(placements);
                 self.kitty_generation = *generation;
                 self.grid.mark_all_dirty();
@@ -538,6 +615,7 @@ impl Terminal {
                 }
                 if i > run_start {
                     self.grid.write_bytes(&data[run_start..i]);
+                    self.sync_kitty_scroll();
                     continue;
                 }
             }
@@ -549,6 +627,7 @@ impl Terminal {
             match action {
                 Action::Print(_) => {
                     let run_start = i - 1;
+                    let mut flushed = false;
                     while i < len {
                         let next_action = self.parser.advance(data[i]);
                         match next_action {
@@ -562,6 +641,7 @@ impl Terminal {
                                     self.grid.write_bytes(&data[run_start..i]);
                                 }
                                 i += 1;
+                                flushed = true;
                                 if !matches!(next_action, Action::Nop) {
                                     self.handle_action(next_action);
                                 }
@@ -569,7 +649,7 @@ impl Terminal {
                             }
                         }
                     }
-                    if i >= len {
+                    if !flushed {
                         if use_line_drawing {
                             self.write_bytes_translated(&data[run_start..i]);
                         } else {
@@ -583,22 +663,7 @@ impl Terminal {
                     }
                 }
             }
-        }
-        self.prune_evicted_kitty_placements();
-    }
-
-    fn prune_evicted_kitty_placements(&mut self) {
-        let oldest_retained_row = self
-            .grid
-            .history_rows()
-            .saturating_sub(self.grid.scrollback_len() as u64);
-        let before = self.kitty_placements.len();
-        self.kitty_placements.retain(|placement| {
-            placement.row.saturating_add(placement.rows.max(1) as u64) > oldest_retained_row
-        });
-        if self.kitty_placements.len() != before {
-            self.kitty_generation = self.kitty_generation.wrapping_add(1);
-            self.grid.mark_all_dirty();
+            self.sync_kitty_scroll();
         }
     }
 
@@ -640,6 +705,7 @@ impl Terminal {
     }
 
     fn handle_action(&mut self, action: Action) {
+        self.sync_kitty_scroll();
         match action {
             Action::Execute(byte) => self.execute(byte),
             Action::CsiDispatch {
@@ -696,10 +762,11 @@ impl Terminal {
             (0, b'J') => match p.param(0, 0) {
                 0 => self.grid.erase_below(),
                 1 => self.grid.erase_above(),
-                2 | 3 => {
+                2 => {
                     self.grid.erase_all();
                     self.clear_visible_kitty_placements();
                 }
+                3 => self.grid.clear_scrollback(),
                 _ => {}
             },
             (0, b'K') => match p.param(0, 0) {
@@ -932,7 +999,7 @@ impl Terminal {
                         i += 4;
                     }
                 }
-                39 => self.grid.set_fg(0),
+                39 => self.grid.set_fg(crate::grid::COLOR_DEFAULT),
                 40..=47 => self.grid.set_bg((params[i] - 40) as u32),
                 48 if i + 1 < params.len() => {
                     if params[i + 1] == 5 && i + 2 < params.len() {
@@ -946,7 +1013,7 @@ impl Terminal {
                         i += 4;
                     }
                 }
-                49 => self.grid.set_bg(0),
+                49 => self.grid.set_bg(crate::grid::COLOR_DEFAULT),
                 58 if i + 1 < params.len() => {
                     if params[i + 1] == 5 && i + 2 < params.len() {
                         self.grid.set_underline_color(params[i + 2] as u32);
@@ -977,7 +1044,12 @@ impl Terminal {
                 self.grid.line_feed();
             }
             (0, b'c') => {
-                *self = Self::new(self.cols, self.rows);
+                let mut reset =
+                    Self::new_with_scrollback(self.cols, self.rows, self.scrollback_limit);
+                reset.set_default_colors(self.default_foreground, self.default_background);
+                reset.kitty_generation = self.kitty_generation.wrapping_add(1);
+                reset.kitty_image_generation = self.kitty_image_generation.wrapping_add(1);
+                *self = reset;
             }
             (0, b'7') => self.save_cursor(),
             (0, b'8') => self.restore_cursor(),
@@ -1006,23 +1078,25 @@ impl Terminal {
                     }
                 }
                 b"1" => {}
-                b"10" if payload == b"?" => {
-                    self.response_buf
-                        .extend_from_slice(b"\x1b]10;rgb:cd/d6/f4\x1b\\");
-                }
-                b"11" if payload == b"?" => {
-                    self.response_buf
-                        .extend_from_slice(b"\x1b]11;rgb:00/00/00\x1b\\");
+                b"10" | b"11" if payload == b"?" => {
+                    let (command, [r, g, b]) = if cmd == b"10" {
+                        (10, self.default_foreground)
+                    } else {
+                        (11, self.default_background)
+                    };
+                    self.response_buf.extend_from_slice(
+                        format!("\x1b]{command};rgb:{r:02x}/{g:02x}/{b:02x}\x1b\\").as_bytes(),
+                    );
                 }
                 b"52" => {
                     if let Some(semi2) = payload.iter().position(|&b| b == b';') {
                         let b64_data = &payload[semi2 + 1..];
                         if b64_data != b"?" {
-                            let data = b64_data.to_vec();
-                            self.osc52_clipboard = Some(data.clone());
+                            let clipboard_data = b64_data.to_vec();
+                            self.osc52_clipboard = Some(clipboard_data.clone());
                             event = OscEvent::Clipboard {
                                 raw: data.to_vec(),
-                                data,
+                                data: clipboard_data,
                             };
                         }
                     }
@@ -1077,9 +1151,44 @@ impl Terminal {
             let event = ApcEvent::KittyGraphics(data[1..].to_vec());
             self.control_strings.push_apc(event);
             self.handle_kitty_graphics(&data[1..]);
+        } else if let Some(source) = data.strip_prefix(LATEX_APC_PREFIX) {
+            let event = ApcEvent::Latex(source.to_vec());
+            self.control_strings.push_apc(event);
+            self.handle_latex(source);
         } else {
             let event = ApcEvent::Generic(data.to_vec());
             self.control_strings.push_apc(event);
+        }
+    }
+
+    fn handle_latex(&mut self, source: &[u8]) {
+        match render_latex(source) {
+            Ok(layout) if layout.width() <= usize::from(self.cols) => {
+                self.write_latex_layout(&layout);
+            }
+            Ok(_) | Err(_) => self.grid.write_bytes(source),
+        }
+    }
+
+    fn write_latex_layout(&mut self, layout: &LatexLayout) {
+        if layout.lines().is_empty() || layout.width() == 0 {
+            return;
+        }
+
+        let (cursor_col, _) = self.grid.cursor_pos();
+        if cursor_col > 0 && cursor_col.saturating_add(layout.width()) > usize::from(self.cols) {
+            self.grid.carriage_return();
+            self.grid.line_feed();
+        }
+        let (start_col, _) = self.grid.cursor_pos();
+
+        for (index, line) in layout.lines().iter().enumerate() {
+            self.grid.set_cursor_col(start_col);
+            self.grid.write_bytes(line.as_bytes());
+            if index + 1 < layout.lines().len() {
+                self.grid.carriage_return();
+                self.grid.line_feed();
+            }
         }
     }
 
@@ -1153,52 +1262,76 @@ impl Terminal {
             quiet,
         };
 
-        if !action_specified && self.kitty_upload.more_chunks {
-            if quiet_specified {
+        let continuing = self.kitty_upload.more_chunks || self.kitty_upload.discarding;
+        if continuing && !action_specified {
+            // Continuation chunks carry only m= (and optionally q=). Route them
+            // through the bounded chunk path below using the pending request.
+            if quiet_specified && self.kitty_upload.more_chunks {
                 self.kitty_upload.pending_quiet = quiet;
             }
-            self.kitty_upload.payload_buf.extend_from_slice(payload);
-            if more {
-                return;
-            }
-
-            let full_payload = std::mem::take(&mut self.kitty_upload.payload_buf);
-            let request = KittyImageFinalize {
-                id: self.kitty_upload.pending_id,
-                compression: self.kitty_upload.pending_compression,
-                format: self.kitty_upload.pending_fmt,
-                width: self.kitty_upload.pending_width,
-                height: self.kitty_upload.pending_height,
-                action: self.kitty_upload.pending_action,
-                virtual_placement: self.kitty_upload.pending_virtual_placement,
-                cols: self.kitty_upload.pending_cols,
-                rows_param: self.kitty_upload.pending_rows,
-            };
-            let final_quiet = self.kitty_upload.pending_quiet;
-            self.abort_partial_kitty_upload();
-            self.finalize_kitty_image(request, &full_payload, final_quiet);
-            return;
-        }
-
-        if action_specified && self.kitty_upload.more_chunks {
+            action = 0;
+        } else if continuing {
             self.abort_partial_kitty_upload();
         }
 
         match action {
-            b't' | b'T' => {
-                if more {
+            b't' | b'T' | 0 => {
+                if self.kitty_upload.discarding {
+                    if !more {
+                        self.abort_partial_kitty_upload();
+                    }
+                    return;
+                }
+                if action == 0 && !self.kitty_upload.more_chunks && !more {
+                    return;
+                }
+                if self.kitty_upload.more_chunks || more {
+                    if !self.kitty_upload.more_chunks {
+                        self.kitty_upload.pending_id = img_id;
+                        self.kitty_upload.pending_fmt = fmt;
+                        self.kitty_upload.pending_width = width;
+                        self.kitty_upload.pending_height = height;
+                        self.kitty_upload.pending_compression = compression;
+                        self.kitty_upload.pending_action = action;
+                        self.kitty_upload.pending_cols = cols;
+                        self.kitty_upload.pending_rows = rows_param;
+                        self.kitty_upload.pending_quiet = quiet;
+                        self.kitty_upload.pending_virtual_placement = virtual_placement;
+                    }
+                    if payload.len()
+                        > MAX_KITTY_PAYLOAD_BYTES
+                            .saturating_sub(self.kitty_upload.payload_buf.len())
+                    {
+                        self.push_kitty_response(
+                            self.kitty_upload.pending_id,
+                            self.kitty_upload.pending_quiet,
+                            "ENOSPC:upload limit exceeded",
+                        );
+                        self.abort_partial_kitty_upload();
+                        self.kitty_upload.discarding = more;
+                        return;
+                    }
                     self.kitty_upload.payload_buf.extend_from_slice(payload);
-                    self.kitty_upload.pending_action = action;
-                    self.kitty_upload.pending_id = img_id;
-                    self.kitty_upload.pending_fmt = if format_specified { fmt } else { 32 };
-                    self.kitty_upload.pending_width = width;
-                    self.kitty_upload.pending_height = height;
-                    self.kitty_upload.pending_cols = cols;
-                    self.kitty_upload.pending_rows = rows_param;
-                    self.kitty_upload.pending_quiet = quiet;
-                    self.kitty_upload.pending_compression = compression;
-                    self.kitty_upload.pending_virtual_placement = virtual_placement;
-                    self.kitty_upload.more_chunks = true;
+                    self.kitty_upload.more_chunks = more;
+                    if !more {
+                        let upload = std::mem::take(&mut self.kitty_upload);
+                        let request = KittyImageFinalize {
+                            id: upload.pending_id,
+                            compression: upload.pending_compression,
+                            format: upload.pending_fmt,
+                            width: upload.pending_width,
+                            height: upload.pending_height,
+                            action: upload.pending_action,
+                            virtual_placement: upload.pending_virtual_placement,
+                            cols: upload.pending_cols,
+                            rows_param: upload.pending_rows,
+                        };
+                        self.finalize_kitty_image(
+                            request,
+                            &upload.payload_buf,
+                            upload.pending_quiet,
+                        );
+                    }
                     return;
                 }
                 let request = KittyImageFinalize {
@@ -1215,12 +1348,16 @@ impl Terminal {
                 self.finalize_kitty_image(request, payload, command.quiet);
             }
             b'p' => {
+                if self.kitty_placement_count() >= MAX_KITTY_PLACEMENTS {
+                    self.push_kitty_response(img_id, quiet, "ENOSPC:placement limit exceeded");
+                    return;
+                }
                 if let Some(_img) = self.kitty_images.iter().find(|i| i.id == img_id) {
                     let (col, row) = self.grid.cursor_pos();
                     self.kitty_placements.push(KittyPlacement {
                         image_id: img_id,
                         col,
-                        row: self.grid.history_rows().saturating_add(row as u64),
+                        row: row as i64,
                         cols: if cols > 0 { cols as usize } else { 1 },
                         rows: if rows_param > 0 {
                             rows_param as usize
@@ -1272,12 +1409,9 @@ impl Terminal {
             request.width,
             request.height,
         ) {
-            Ok(decoded) => decoded,
+            Ok(image) => image,
             Err(error) => {
-                if request.id > 0 && quiet < 2 {
-                    let response = format!("\x1b_Gi={};EINVAL:{}\x1b\\", request.id, error);
-                    self.response_buf.extend_from_slice(response.as_bytes());
-                }
+                self.push_kitty_response(request.id, quiet, &format!("EINVAL:{error}"));
                 return;
             }
         };
@@ -1285,8 +1419,33 @@ impl Terminal {
         let actual_id = if request.id > 0 {
             request.id
         } else {
-            (self.kitty_images.len() as u32) + 1
+            // At most MAX_KITTY_IMAGES ids are in use, including sparse explicit ids.
+            (1..=MAX_KITTY_IMAGES as u32 + 1)
+                .find(|&id| self.kitty_image(id).is_none())
+                .unwrap()
         };
+        let remaining_bytes: usize = self
+            .kitty_images
+            .iter()
+            .filter(|image| image.id != actual_id)
+            .map(|image| image.data.len())
+            .sum();
+        let replacing = self.kitty_image(actual_id).is_some();
+        let places = request.action == b'T' || request.action == 0;
+        let replaced_placements = self
+            .kitty_placements
+            .iter()
+            .chain(self.saved_main_kitty_placements.iter().flatten())
+            .filter(|p| p.image_id == actual_id)
+            .count();
+        if decoded.len() > MAX_KITTY_IMAGE_STORAGE_BYTES.saturating_sub(remaining_bytes)
+            || (!replacing && self.kitty_images.len() >= MAX_KITTY_IMAGES)
+            || (places
+                && self.kitty_placement_count() - replaced_placements >= MAX_KITTY_PLACEMENTS)
+        {
+            self.push_kitty_response(request.id, quiet, "ENOSPC:image storage limit exceeded");
+            return;
+        }
 
         let image = KittyImage {
             id: actual_id,
@@ -1295,16 +1454,16 @@ impl Terminal {
             data: decoded,
         };
 
-        self.kitty_placements.retain(|p| p.image_id != actual_id);
-        self.kitty_images.retain(|i| i.id != actual_id);
+        self.delete_kitty_image(actual_id);
         self.kitty_images.push(image);
+        self.kitty_image_generation = self.kitty_image_generation.wrapping_add(1);
 
         if (request.action == b'T' || request.action == 0) && !request.virtual_placement {
             let (col, row) = self.grid.cursor_pos();
             self.kitty_placements.push(KittyPlacement {
                 image_id: actual_id,
                 col,
-                row: self.grid.history_rows().saturating_add(row as u64),
+                row: row as i64,
                 cols: if request.cols > 0 {
                     request.cols as usize
                 } else {
@@ -1320,42 +1479,43 @@ impl Terminal {
         self.kitty_generation = self.kitty_generation.wrapping_add(1);
         self.grid.mark_all_dirty();
 
-        if actual_id > 0 && quiet < 1 {
-            let resp = format!("\x1b_Gi={};OK\x1b\\", actual_id);
+        self.push_kitty_response(actual_id, quiet, "OK");
+    }
+
+    fn kitty_placement_count(&self) -> usize {
+        self.kitty_placements.len()
+            + self
+                .saved_main_kitty_placements
+                .as_ref()
+                .map_or(0, Vec::len)
+    }
+
+    fn push_kitty_response(&mut self, id: u32, quiet: u8, payload: &str) {
+        if id == 0 || quiet >= if payload == "OK" { 1 } else { 2 } {
+            return;
+        }
+        let resp = format!("\x1b_Gi={id};{payload}\x1b\\");
+        // Embedders should drain responses after process(). Unread Kitty replies
+        // must not turn a stream of tiny commands into unbounded retained memory.
+        if self.response_buf.len().saturating_add(resp.len()) <= 64 * 1024 {
             self.response_buf.extend_from_slice(resp.as_bytes());
         }
     }
 
     fn push_kitty_graphics_response(&mut self, command: KittyGraphicsCommand, success: bool) {
-        if command.image_id == 0
-            || (success && command.quiet >= 1)
-            || (!success && command.quiet >= 2)
-        {
-            return;
-        }
-
-        let payload = if success {
-            "OK".to_string()
-        } else {
-            "ENOENT:image not found".to_string()
-        };
-        let resp = format!("\x1b_Gi={};{}\x1b\\", command.image_id, payload);
-        self.response_buf.extend_from_slice(resp.as_bytes());
+        self.push_kitty_response(
+            command.image_id,
+            command.quiet,
+            if success {
+                "OK"
+            } else {
+                "ENOENT:image not found"
+            },
+        );
     }
 
     fn abort_partial_kitty_upload(&mut self) {
-        self.kitty_upload.payload_buf.clear();
-        self.kitty_upload.pending_action = 0;
-        self.kitty_upload.pending_id = 0;
-        self.kitty_upload.pending_fmt = 0;
-        self.kitty_upload.pending_width = 0;
-        self.kitty_upload.pending_height = 0;
-        self.kitty_upload.pending_cols = 0;
-        self.kitty_upload.pending_rows = 0;
-        self.kitty_upload.pending_quiet = 0;
-        self.kitty_upload.pending_compression = None;
-        self.kitty_upload.pending_virtual_placement = false;
-        self.kitty_upload.more_chunks = false;
+        self.kitty_upload = KittyUploadState::default();
     }
 
     fn delete_all_kitty_placements(&mut self) -> bool {
@@ -1368,7 +1528,13 @@ impl Terminal {
         let placements_before = self.kitty_placements.len();
         let images_before = self.kitty_images.len();
         self.kitty_images.retain(|i| i.id != img_id);
+        if self.kitty_images.len() != images_before {
+            self.kitty_image_generation = self.kitty_image_generation.wrapping_add(1);
+        }
         self.kitty_placements.retain(|p| p.image_id != img_id);
+        if let Some(saved) = &mut self.saved_main_kitty_placements {
+            saved.retain(|p| p.image_id != img_id);
+        }
         self.kitty_placements.len() != placements_before || self.kitty_images.len() != images_before
     }
 
@@ -1381,12 +1547,95 @@ impl Terminal {
         &self.kitty_images
     }
 
+    /// Raw live-relative anchors. Use the viewport iterator when painting.
     pub fn kitty_placements(&self) -> &[KittyPlacement] {
         &self.kitty_placements
     }
 
+    pub fn kitty_viewport_placements(&self) -> KittyViewportPlacements<'_> {
+        self.kitty_viewport_placements_at_scroll(self.grid.scroll_offset)
+    }
+
+    pub fn kitty_viewport_placements_at_scroll(
+        &self,
+        offset: usize,
+    ) -> KittyViewportPlacements<'_> {
+        KittyViewportPlacements::new(self.kitty_placements(), offset)
+    }
+
     pub fn kitty_generation(&self) -> u64 {
         self.kitty_generation
+    }
+
+    /// Pixel-storage invalidation only. Placement/viewport/screen changes do not
+    /// require hashing or re-uploading the shared image data.
+    pub fn kitty_image_generation(&self) -> u64 {
+        self.kitty_image_generation
+    }
+
+    fn placement_in_grid(placement: &KittyPlacement, grid: &Grid) -> bool {
+        let oldest = -(i64::try_from(grid.scrollback_len()).unwrap_or(i64::MAX));
+        placement.bottom_row() > oldest
+            && placement.row < grid.rows as i64
+            && placement.col < grid.cols
+    }
+
+    fn sync_kitty_scroll(&mut self) {
+        use crate::grid::ScrollDamage;
+        let Some(damage) = self.grid.take_scroll_damage() else {
+            return;
+        };
+        let mut changed = false;
+        let mut evicted_images = Vec::new();
+        let grid = &self.grid;
+        self.kitty_placements.retain_mut(|placement| {
+            let keep = match damage {
+                ScrollDamage::History { rows } => {
+                    placement.row = placement
+                        .row
+                        .saturating_sub(i64::try_from(rows).unwrap_or(i64::MAX));
+                    changed = true;
+                    Self::placement_in_grid(placement, grid)
+                }
+                ScrollDamage::Region { top, bottom, delta } => {
+                    if placement.row < top as i64 || placement.row >= bottom as i64 {
+                        return true;
+                    }
+                    changed = true;
+                    placement.row = placement.row.saturating_add(delta as i64);
+                    placement.row >= top as i64 && placement.row < bottom as i64
+                }
+                ScrollDamage::Prune => Self::placement_in_grid(placement, grid),
+                ScrollDamage::Clear => false,
+            };
+            if !keep && matches!(damage, ScrollDamage::History { .. } | ScrollDamage::Prune) {
+                evicted_images.push(placement.image_id);
+            }
+            changed |= !keep;
+            keep
+        });
+        self.reclaim_evicted_kitty_images(evicted_images);
+        if changed {
+            self.kitty_generation = self.kitty_generation.wrapping_add(1);
+            self.grid.mark_all_dirty();
+        }
+    }
+
+    fn reclaim_evicted_kitty_images(&mut self, mut evicted_images: Vec<u32>) {
+        // Only images whose placements were evicted are candidates. In particular,
+        // never-placed uploads and placement-only deletes remain reusable.
+        evicted_images.sort_unstable();
+        evicted_images.dedup();
+        for id in evicted_images {
+            let still_placed = self
+                .kitty_placements
+                .iter()
+                .chain(self.saved_main_kitty_placements.iter().flatten())
+                .any(|placement| placement.image_id == id);
+            if !still_placed {
+                self.delete_kitty_image(id);
+            }
+        }
     }
 
     fn enter_alt_screen(&mut self) {
@@ -1405,12 +1654,17 @@ impl Terminal {
             ),
         );
         self.alt_grid = Some(main);
+        self.kitty_generation = self.kitty_generation.wrapping_add(1);
+        self.abort_partial_kitty_upload();
     }
 
     fn leave_alt_screen(&mut self) {
         if let Some(main) = self.alt_grid.take() {
             self.grid = main;
             self.kitty_placements = self.saved_main_kitty_placements.take().unwrap_or_default();
+            self.kitty_generation = self.kitty_generation.wrapping_add(1);
+            self.grid.mark_all_dirty();
+            self.abort_partial_kitty_upload();
         }
     }
 
@@ -1418,9 +1672,13 @@ impl Terminal {
         if self.kitty_placements.is_empty() {
             return;
         }
-        self.kitty_placements.clear();
-        self.kitty_generation = self.kitty_generation.wrapping_add(1);
-        self.grid.mark_all_dirty();
+        let before = self.kitty_placements.len();
+        self.kitty_placements
+            .retain(|placement| placement.bottom_row() <= 0);
+        if self.kitty_placements.len() != before {
+            self.kitty_generation = self.kitty_generation.wrapping_add(1);
+            self.grid.mark_all_dirty();
+        }
     }
 
     fn current_kitty_keyboard_flags_mut(&mut self) -> &mut u8 {
@@ -1944,6 +2202,45 @@ mod tests {
     }
 
     #[test]
+    fn latex_apc_renders_fraction_into_selectable_grid_cells() {
+        let mut t = Terminal::new(12, 6);
+        t.process(b"> \x1b_L;\\frac{a}{b}\x1b\\");
+
+        assert_eq!(t.grid.cell_char(0, 0), '>');
+        assert_eq!(t.grid.cell_char(0, 2), 'a');
+        assert_eq!(t.grid.cell_char(1, 2), '─');
+        assert_eq!(t.grid.cell_char(2, 2), 'b');
+        assert_eq!(t.grid.cursor_pos(), (3, 2));
+        assert_eq!(
+            t.take_apc(),
+            Some(ApcEvent::Latex(br"\frac{a}{b}".to_vec()))
+        );
+    }
+
+    #[test]
+    fn latex_apc_moves_to_next_line_when_layout_does_not_fit() {
+        let mut t = Terminal::new(10, 4);
+        t.process(b"123456789\x1b_L;\\sqrt{x}\x1b\\");
+
+        assert_eq!(t.grid.cell_char(0, 8), '9');
+        assert_eq!(t.grid.cell_char(1, 0), '√');
+        assert_eq!(t.grid.cell_char(1, 1), 'x');
+        assert_eq!(t.grid.cursor_pos(), (2, 1));
+    }
+
+    #[test]
+    fn latex_apc_uses_visible_source_fallback_for_unsupported_input() {
+        let mut t = Terminal::new(30, 4);
+        t.process(b"\x1b_L;\\color{red}{x}\x1b\\");
+
+        assert!(t.grid.get_text(0, 1).starts_with(r"\color{red}{x}"));
+        assert_eq!(
+            t.take_apc(),
+            Some(ApcEvent::Latex(br"\color{red}{x}".to_vec()))
+        );
+    }
+
+    #[test]
     fn control_string_events_preserve_cross_family_order() {
         let mut t = Terminal::new(80, 24);
         t.process(b"\x1b]0;Title\x1b\\\x1bP+q12\x1b\\\x1b_Gi=7,a=d\x1b\\");
@@ -1983,7 +2280,7 @@ mod tests {
         assert_eq!(
             t.take_osc(),
             Some(OscEvent::Clipboard {
-                raw: b"Zm9v".to_vec(),
+                raw: b"52;c;Zm9v".to_vec(),
                 data: b"Zm9v".to_vec(),
             })
         );
@@ -2310,6 +2607,198 @@ mod tests {
     }
 
     #[test]
+    fn kitty_placements_follow_linefeeds_into_history() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b[3;1H\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\");
+        let generation = t.kitty_generation();
+        t.process(b"\x1b[4;1H\n");
+        assert_eq!(t.kitty_placements()[0].row, 1);
+        assert_ne!(t.kitty_generation(), generation);
+        t.process(b"\n\n");
+        assert_eq!(t.kitty_placements()[0].row, -1);
+        assert!(t.kitty_image(7).is_some());
+        t.grid.scroll_offset = 1;
+        assert_eq!(t.kitty_viewport_placements().next().unwrap().row, 0);
+    }
+
+    #[test]
+    fn kitty_placements_follow_ascii_wrap_and_unicode_newline_once() {
+        let mut t = Terminal::new(2, 4);
+        t.process(b"\x1b[4;1H\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\");
+        t.process(b"abc"); // Fast ASCII ring-scroll path.
+        assert_eq!(t.kitty_placements()[0].row, 2);
+        t.process("\r\u{e9}\n".as_bytes());
+        assert_eq!(t.kitty_placements()[0].row, 1);
+        assert_eq!(t.grid.cell_char(2, 0), '\u{e9}');
+        assert_eq!(t.grid.cell_char(3, 0), ' ');
+    }
+
+    #[test]
+    fn kitty_scroll_regions_and_reverse_index_leave_outside_anchors_alone() {
+        let mut t = Terminal::new(8, 5);
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\");
+        t.process(b"\x1b[3;1H\x1b_Ga=p,i=7\x1b\\");
+        t.process(b"\x1b[2;4r\x1b[S");
+        assert_eq!(t.kitty_placements()[0].row, 0);
+        assert_eq!(t.kitty_placements()[1].row, 1);
+        t.process(b"\x1b[2;1H\x1bM");
+        assert_eq!(t.kitty_placements()[0].row, 0);
+        assert_eq!(t.kitty_placements()[1].row, 2);
+        t.process(b"\x1b[2T");
+        assert_eq!(t.kitty_placements().len(), 1);
+        assert_eq!(t.kitty_placements()[0].row, 0);
+    }
+
+    #[test]
+    fn kitty_live_placements_project_below_historical_viewport() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\");
+        t.grid.scroll_offset = 1;
+        assert_eq!(t.kitty_placements()[0].row, 3);
+        assert_eq!(TerminalView::kitty_placements(&t)[0].row, 3);
+        assert_eq!(t.kitty_viewport_placements().next().unwrap().row, 4);
+        t.grid.scroll_offset = 0;
+        assert_eq!(t.kitty_placements().len(), 1);
+        t.process(b"\x1b[?1049h\n\n\n\n\n\x1b[?1049l");
+        assert_eq!(
+            t.kitty_placements()[0].row,
+            3,
+            "alt scrolling must not move main anchors"
+        );
+    }
+
+    #[test]
+    fn kitty_chunk_metadata_survives_minimal_continuations() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b_Ga=t,i=7,f=24,s=1,v=1,q=1,m=1;/w\x1b\\");
+        t.process(b"\x1b_Gm=0;AA\x1b\\");
+        assert_eq!(t.kitty_image(7).unwrap().data, [255, 0, 0, 255]);
+        assert!(t.kitty_placements.is_empty(), "a=t must not become a=T");
+        assert!(t.drain_responses().is_none(), "q=1 must survive");
+        t.process(b"\x1b_Ga=T,i=8,f=32,s=1,v=1,c=2,r=3,m=1;/wAA\x1b\\");
+        t.process(b"\x1b_Gm=0;/w==\x1b\\");
+        assert_eq!(
+            (t.kitty_placements[0].cols, t.kitty_placements[0].rows),
+            (2, 3)
+        );
+    }
+
+    #[test]
+    fn kitty_chunk_limit_discards_until_final_chunk_and_recovers() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b_Ga=T,i=7,f=32,s=1,v=1,m=1;\x1b\\");
+        let mut chunk = b"\x1b_Gm=1;".to_vec();
+        chunk.extend(std::iter::repeat_n(b'A', 64 * 1024));
+        chunk.extend_from_slice(b"\x1b\\");
+        for _ in 0..MAX_KITTY_PAYLOAD_BYTES / (64 * 1024) {
+            t.process(&chunk);
+        }
+        assert_eq!(t.kitty_upload.payload_buf.len(), MAX_KITTY_PAYLOAD_BYTES);
+        t.process(b"\x1b_Gm=1;A\x1b\\");
+        assert!(t.kitty_upload.discarding);
+        assert_eq!(t.kitty_upload.payload_buf.capacity(), 0);
+        t.process(b"\x1b_Gm=1;AAAA\x1b\\\x1b_Gm=0;AAAA\x1b\\");
+        assert!(!t.kitty_upload.discarding);
+        assert!(t.kitty_image(7).is_none());
+        t.process(b"\x1b_Ga=T,i=8,s=1,v=1;/wAA/w==\x1b\\");
+        assert!(t.kitty_image(8).is_some());
+    }
+
+    #[test]
+    fn kitty_image_count_and_placement_count_are_bounded_across_screens() {
+        let mut t = Terminal::new(8, 4);
+        for id in 1..=MAX_KITTY_IMAGES + 1 {
+            t.process(format!("\x1b_Ga=t,i={id},s=1,v=1,q=2;/wAA/w==\x1b\\").as_bytes());
+        }
+        assert_eq!(t.kitty_images.len(), MAX_KITTY_IMAGES);
+        assert!(t.kitty_image(MAX_KITTY_IMAGES as u32 + 1).is_none());
+        for _ in 0..MAX_KITTY_PLACEMENTS {
+            t.process(b"\x1b_Ga=p,i=1,q=2\x1b\\");
+        }
+        assert_eq!(t.kitty_placements.len(), MAX_KITTY_PLACEMENTS);
+        t.process(b"\x1b[?1049h\x1b_Ga=p,i=1,q=2\x1b\\");
+        assert!(t.kitty_placements.is_empty());
+        t.process(b"\x1b[?1049l\x1b_Ga=p,i=1,q=2\x1b\\");
+        assert_eq!(t.kitty_placements.len(), MAX_KITTY_PLACEMENTS);
+        // Replacement and deletion release quota without evicting unrelated data.
+        t.process(b"\x1b_Ga=T,i=1,s=1,v=1,q=2;AAD//w==\x1b\\");
+        assert_eq!(t.kitty_placements.len(), 1);
+        assert_eq!(t.kitty_images.len(), MAX_KITTY_IMAGES);
+    }
+
+    #[test]
+    fn kitty_image_byte_budget_rejects_atomically_and_allows_replacement() {
+        let mut t = Terminal::new(8, 4);
+        // Populate the private store at its byte boundary without a huge base64 fixture.
+        for id in 1..=4 {
+            t.kitty_images.push(KittyImage {
+                id,
+                width: 2048,
+                height: 2048,
+                data: vec![0; MAX_KITTY_IMAGE_STORAGE_BYTES / 4],
+            });
+        }
+        t.process(b"\x1b_Ga=t,i=5,s=1,v=1;/wAA/w==\x1b\\");
+        assert!(t.kitty_image(5).is_none());
+        assert!(
+            String::from_utf8(t.drain_responses().unwrap())
+                .unwrap()
+                .contains("ENOSPC")
+        );
+        t.process(b"\x1b_Ga=t,i=1,s=1,v=1;/wAA/w==\x1b\\");
+        assert_eq!(t.kitty_image(1).unwrap().data.len(), 4);
+        t.process(b"\x1b_Ga=t,i=5,s=1,v=1;/wAA/w==\x1b\\");
+        assert!(t.kitty_image(5).is_some());
+    }
+
+    #[test]
+    fn kitty_anonymous_ids_do_not_replace_sparse_explicit_ids() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b_Ga=t,i=2,s=1,v=1;/wAA/w==\x1b\\");
+        t.process(b"\x1b_Ga=t,s=1,v=1;AAD//w==\x1b\\");
+        assert_eq!(t.kitty_image(2).unwrap().data, [255, 0, 0, 255]);
+        assert_eq!(t.kitty_image(1).unwrap().data, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn kitty_unread_replies_are_bounded() {
+        let mut t = Terminal::new(8, 4);
+        for _ in 0..10_000 {
+            t.process(b"\x1b_Ga=p,i=1\x1b\\");
+        }
+        assert!(t.response_buf.len() <= 64 * 1024);
+        assert!(!t.response_buf.is_empty());
+        t.drain_responses();
+        t.process(b"\x1b_Ga=p,i=1\x1b\\");
+        assert!(t.drain_responses().is_some());
+    }
+
+    #[test]
+    fn kitty_alt_switch_invalidates_graphics_and_deleted_images_do_not_reappear() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\");
+        let generation = t.kitty_generation();
+        t.process(b"\x1b[?1049h");
+        assert_ne!(t.kitty_generation(), generation);
+        t.process(b"\x1b_Ga=d,i=7\x1b\\");
+        let generation = t.kitty_generation();
+        t.process(b"\x1b[?1049l");
+        assert_ne!(t.kitty_generation(), generation);
+        assert!(t.kitty_placements.is_empty());
+        assert!(t.kitty_image(7).is_none());
+    }
+
+    #[test]
+    fn kitty_alt_replacement_clears_saved_main_placements() {
+        let mut t = Terminal::new(8, 4);
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\");
+        t.process(b"\x1b[?1049h\x1b_Ga=t,i=7,s=1,v=1;AAD//w==\x1b\\\x1b[?1049l");
+        assert!(t.kitty_placements.is_empty());
+        assert_eq!(t.kitty_image(7).unwrap().data, [0, 0, 255, 255]);
+    }
+
+    #[test]
     fn kitty_graphics_upload_places_and_deletes_image() {
         let mut t = Terminal::new(8, 4);
         t.process(b"\x1b_Ga=T,i=7,f=32,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\");
@@ -2429,9 +2918,7 @@ mod tests {
         assert_eq!(t.kitty_placements[0].image_id, 24);
         assert_eq!(
             t.drain_responses().as_deref(),
-            Some(
-                &b"\x1b_Gi=23;EINVAL:invalid or unsupported PNG data\x1b\\\x1b_Gi=24;OK\x1b\\"[..]
-            )
+            Some(&b"\x1b_Gi=23;EINVAL:invalid kitty PNG payload\x1b\\\x1b_Gi=24;OK\x1b\\"[..])
         );
     }
 
@@ -2945,5 +3432,224 @@ mod tests {
         assert!(modes.in_alt_screen);
         assert_eq!(modes.mouse_mode, 2);
         assert_eq!(modes.kitty_keyboard_flags, 5);
+    }
+
+    #[test]
+    fn kitty_history_partial_edges_and_eviction_follow_text_retention() {
+        let mut t = Terminal::new_with_scrollback(8, 4, 2);
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1,c=2,r=3;/wAA/w==\x1b\\");
+        let pixels = t.kitty_image_generation();
+        t.process(b"\x1b[4;1H\n\n\n\n");
+        assert_eq!(t.grid.scrollback_len(), 2);
+        assert_eq!(t.kitty_placements()[0].row, -4);
+        t.grid.scroll_offset = 2;
+        let projected = t.kitty_viewport_placements().next().unwrap();
+        assert_eq!((projected.row, projected.rows), (-2, 3));
+        assert_eq!(t.kitty_image_generation(), pixels);
+        t.process(b"\n"); // Bottom edge now equals oldest retained text row.
+        assert!(t.kitty_placements().is_empty());
+        assert!(t.kitty_image(7).is_none());
+        assert_ne!(t.kitty_image_generation(), pixels);
+    }
+
+    #[test]
+    fn kitty_history_scroll_count_is_not_clamped_to_screen_height() {
+        let mut t = Terminal::new_with_scrollback(2, 2, 32);
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\");
+        t.process(b"abcdefghijklmnopqrstuvwx");
+        assert_eq!(t.grid.scrollback_len(), 10);
+        assert_eq!(t.kitty_placements()[0].row, -10);
+        let view: &dyn TerminalView = &t;
+        assert_eq!(
+            view.kitty_viewport_placements_at_scroll(11)
+                .next()
+                .unwrap()
+                .row,
+            1
+        );
+        assert_eq!(
+            t.kitty_placements()[0].row,
+            -10,
+            "projection must not mutate raw anchors"
+        );
+    }
+
+    #[test]
+    fn kitty_region_and_alt_scrolling_never_create_image_history() {
+        let mut t = Terminal::new_with_scrollback(8, 4, 16);
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1,r=3;/wAA/w==\x1b\\");
+        t.process(b"\x1b[1;3r\x1b[S");
+        assert_eq!(t.grid.scrollback_len(), 0);
+        assert!(t.kitty_placements().is_empty());
+        t.process(b"\x1b[?1049h\x1b_Ga=p,i=7,r=3\x1b\\\x1b[4;1H\n");
+        assert_eq!(t.grid.scrollback_len(), 0);
+        assert!(t.kitty_placements().is_empty());
+        assert!(
+            t.kitty_image(7).is_some(),
+            "non-history removal preserves reusable uploads"
+        );
+        t.process(b"\x1b[?1049l");
+        assert!(t.kitty_placements().is_empty());
+    }
+
+    #[test]
+    fn kitty_history_survives_region_scroll_reverse_index_and_alt_screen() {
+        let mut t = Terminal::new_with_scrollback(8, 4, 16);
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\\x1b[4;1H\n");
+        assert_eq!(t.kitty_placements()[0].row, -1);
+        t.process(b"\x1b[2;3r\x1b[S\x1b[T\x1b[1;1H\x1bM");
+        assert_eq!(t.kitty_placements()[0].row, -1);
+        t.grid.scroll_offset = 1;
+        t.process(b"\x1b[?1049h\x1b[4;1H\n\n\n\x1b[?1049l");
+        assert_eq!(t.grid.scroll_offset, 1);
+        assert_eq!(t.kitty_viewport_placements().next().unwrap().row, 0);
+    }
+
+    #[test]
+    fn kitty_ed2_preserves_history_ed3_clears_history_not_live_text() {
+        let mut t = Terminal::new_with_scrollback(8, 4, 16);
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\\x1b[4;1H\n");
+        t.process(b"\x1b_Ga=T,i=8,s=1,v=1;/wAA/w==\x1b\\\x1b[2J");
+        assert_eq!(t.kitty_placements().len(), 1);
+        assert_eq!(t.kitty_placements()[0].image_id, 7);
+        assert_eq!(t.grid.scrollback_len(), 1);
+        t.process(b"\x1b[1;1Hlive\x1b_Ga=p,i=8\x1b\\");
+        t.grid.scroll_offset = 1;
+        t.process(b"\x1b[3J");
+        assert_eq!(t.grid.scrollback_len(), 0);
+        assert_eq!(t.grid.scroll_offset, 0);
+        assert_eq!(t.grid.cell_char(0, 0), 'l');
+        assert_eq!(t.kitty_placements().len(), 1);
+        assert_eq!(t.kitty_placements()[0].image_id, 8);
+        assert!(t.kitty_image(7).is_none());
+    }
+
+    #[test]
+    fn kitty_eviction_only_reclaims_last_reference_not_unplaced_uploads() {
+        let mut t = Terminal::new_with_scrollback(8, 4, 1);
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\");
+        t.process(b"\x1b[4;1H\x1b_Ga=p,i=7\x1b\\");
+        t.process(b"\x1b_Ga=t,i=8,s=1,v=1;/wAA/w==\x1b\\\n\n");
+        assert_eq!(t.kitty_placements().len(), 1);
+        assert_eq!(t.kitty_placements()[0].row, 1);
+        assert!(t.kitty_image(7).is_some());
+        assert!(t.kitty_image(8).is_some());
+        t.process(b"\n\n\n");
+        assert!(t.kitty_image(7).is_none());
+        assert!(t.kitty_image(8).is_some());
+    }
+
+    #[test]
+    fn kitty_history_delete_and_retransmit_remove_saved_anchors() {
+        for command in [
+            b"\x1b_Ga=d,d=i,i=7\x1b\\".as_slice(),
+            b"\x1b_Ga=t,i=7,s=1,v=1;AP8A/w==\x1b\\".as_slice(),
+        ] {
+            let mut t = Terminal::new_with_scrollback(8, 4, 4);
+            t.process(b"\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\\x1b[4;1H\n\x1b[?1049h");
+            t.process(command);
+            t.process(b"\x1b[?1049l");
+            assert!(t.kitty_placements().is_empty());
+        }
+    }
+
+    #[test]
+    fn kitty_resize_preserves_history_and_prunes_lost_live_anchors() {
+        let mut t = Terminal::new_with_scrollback(8, 4, 4);
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\\x1b[4;1H\n");
+        t.process(b"\x1b_Ga=p,i=7\x1b\\\x1b[1;8H\x1b_Ga=p,i=7\x1b\\");
+        t.grid.scroll_offset = 1;
+        t.resize(8, 4);
+        assert_eq!(t.kitty_placements().len(), 3);
+        t.resize(6, 3);
+        assert_eq!(t.grid.scrollback_len(), 1);
+        assert_eq!(t.grid.scroll_offset, 1);
+        assert_eq!(t.kitty_placements().len(), 1);
+        assert_eq!(t.kitty_placements()[0].row, -1);
+        t.process(b"\x1b[?1049h");
+        t.resize(10, 5);
+        t.process(b"\x1b[?1049l");
+        assert_eq!(t.grid.scrollback_len(), 1);
+        assert_eq!(t.kitty_viewport_placements().next().unwrap().row, 0);
+    }
+
+    #[test]
+    fn kitty_pixel_generation_ignores_geometry_but_survives_reset_same_batch() {
+        let mut t = Terminal::new_with_scrollback(8, 4, 4);
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\");
+        let pixels = t.kitty_image_generation();
+        t.process(b"\x1b[4;1H\n\x1b_Ga=p,i=7\x1b\\\x1b[?1049h\x1b[?1049l");
+        t.grid.scroll_offset = 1;
+        assert_eq!(t.kitty_image_generation(), pixels);
+        t.process(b"\x1b_Ga=d,d=a\x1b\\");
+        assert_eq!(t.kitty_image_generation(), pixels);
+        assert!(t.kitty_image(7).is_some());
+        t.process(b"\x1bc\x1b_Ga=T,i=7,s=1,v=1;AP8A/w==\x1b\\");
+        assert_ne!(t.kitty_image_generation(), pixels);
+        assert_eq!(t.kitty_image(7).unwrap().data, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn kitty_wire_negative_anchors_and_image_generation() {
+        use crate::protocol::{KittyImageData, KittyImagePlacement};
+        let mut t = Terminal::new(8, 4);
+        let mut message = ServerMessage::KittyImageState {
+            window_id: 1,
+            generation: 1,
+            images: vec![KittyImageData {
+                id: 7,
+                width: 1,
+                height: 1,
+                data: vec![255, 0, 0, 255],
+            }],
+            placements: vec![KittyImagePlacement {
+                image_id: 7,
+                col: 0,
+                row: -3,
+                cols: 1,
+                rows: 4,
+            }],
+        };
+        t.apply_server_message(&message);
+        let pixels = t.kitty_image_generation();
+        assert_eq!(t.kitty_placements()[0].row, -3);
+        if let ServerMessage::KittyImageState {
+            placements,
+            generation,
+            ..
+        } = &mut message
+        {
+            placements[0].row = -4;
+            *generation += 1;
+        }
+        t.apply_server_message(&message);
+        assert_eq!(t.kitty_image_generation(), pixels);
+        assert_eq!(t.kitty_placements()[0].row, -4);
+    }
+
+    #[test]
+    fn kitty_resize_reclaims_saved_orphans_but_preserves_shared_screen_images() {
+        let mut t = Terminal::new_with_scrollback(8, 4, 4);
+        t.process(b"\x1b[1;8H\x1b_Ga=T,i=7,s=1,v=1;/wAA/w==\x1b\\");
+        t.process(b"\x1b[?1049h\x1b_Ga=p,i=7\x1b\\");
+        t.resize(4, 4); // Saved main anchor is lost, alternate placement remains.
+        assert!(t.kitty_image(7).is_some());
+        assert_eq!(t.kitty_placements().len(), 1);
+        t.process(b"\x1b[?1049l");
+        assert!(t.kitty_placements().is_empty());
+
+        t.process(b"\x1b[1;4H\x1b_Ga=p,i=7\x1b\\\x1b[?1049h");
+        t.resize(2, 4); // No remaining reference on either screen.
+        assert!(t.kitty_image(7).is_none());
+        t.process(b"\x1b[?1049l");
+        assert!(t.kitty_placements().is_empty());
+    }
+
+    #[test]
+    fn kitty_zero_history_limit_never_keeps_negative_anchors() {
+        let mut t = Terminal::new_with_scrollback(8, 4, 0);
+        t.process(b"\x1b_Ga=T,i=7,s=1,v=1,r=3;/wAA/w==\x1b\\\x1b[4;1H\n");
+        assert_eq!(t.grid.scrollback_len(), 0);
+        assert!(t.kitty_placements().is_empty());
     }
 }

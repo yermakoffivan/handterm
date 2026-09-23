@@ -1,4 +1,4 @@
-use crate::grid::{COLOR_FLAG_RGB, Grid};
+use crate::grid::{COLOR_DEFAULT, COLOR_FLAG_RGB, Grid};
 
 /// Unicode placeholder used by the Kitty graphics protocol for virtual placements.
 pub const KITTY_UNICODE_PLACEHOLDER: u32 = 0x10_EEEE;
@@ -66,7 +66,13 @@ pub fn fill_kitty_virtual_cells(
                 run = None;
                 continue;
             };
-            let Some(_placement_id) = kitty_color_id(cell.underline_color) else {
+            // An unset underline color means placement id 0 (Kitty spec).
+            let placement_id = if cell.underline_color == COLOR_DEFAULT {
+                Some(0)
+            } else {
+                kitty_color_id(cell.underline_color)
+            };
+            let Some(_placement_id) = placement_id else {
                 run = None;
                 continue;
             };

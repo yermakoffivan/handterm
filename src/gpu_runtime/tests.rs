@@ -9,13 +9,80 @@ use crate::font::GlyphAtlas;
 use crate::gpu_frame::{
     FLAG_COLOR_GLYPH, FLAG_CURLY_UL, FLAG_CURSOR_BAR, FLAG_CURSOR_UNDERLINE, FLAG_DASHED_UL,
     FLAG_DOTTED_UL, FLAG_DOUBLE_UL, FLAG_HAS_GLYPH, FLAG_STRIKETHROUGH, FLAG_UNDERLINE,
-    fill_image_instances, fill_image_instances_with_viewport_offset,
 };
 use crate::render::OffscreenRenderer;
 use crate::terminal::Terminal;
 use crate::workloads::{
     EMOJI_AND_SHADE_TRANSCRIPT, STARSHIP_PROMPT_TRANSCRIPT, TUI_HELP_WITH_IMAGE_TRANSCRIPT,
 };
+
+#[test]
+fn surface_image_caches_isolate_equal_terminal_ids_and_reuse_after_scroll() {
+    // Model atlas uploads in memory, exercising the same surface-owned cache
+    // lookup as ensure_kitty_image_in_atlas without a GPU device or window.
+    fn resolve(
+        cache: &mut HashMap<(u64, u32), GpuImageEntry>,
+        namespace: u64,
+        terminal: &Terminal,
+        atlas_pixels: &mut Vec<Vec<u8>>,
+    ) -> usize {
+        let generation = terminal.kitty_image_generation();
+        if let Some(entry) = cache.get(&(namespace, 7))
+            && entry.generation == generation
+        {
+            return entry.x as usize;
+        }
+        let image = terminal.kitty_image(7).unwrap();
+        let x = atlas_pixels.len();
+        atlas_pixels.push(image.data.clone());
+        cache.insert(
+            (namespace, 7),
+            GpuImageEntry {
+                x: x as u32,
+                y: 0,
+                width: 1,
+                height: 1,
+                allocated_width: 1,
+                allocated_height: 1,
+                generation,
+            },
+        );
+        x
+    }
+
+    let mut red = Terminal::new_with_scrollback(2, 2, 8);
+    let mut blue = Terminal::new_with_scrollback(2, 2, 8);
+    red.process(b"\x1b_Ga=T,i=7,f=32,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\");
+    blue.process(b"\x1b_Ga=T,i=7,f=32,s=1,v=1,c=1,r=1;AAD//w==\x1b\\");
+    assert_eq!(red.kitty_image_generation(), blue.kitty_image_generation());
+    let mut cache = HashMap::new();
+    let mut pixels = Vec::new();
+    let red_slot = resolve(&mut cache, 1, &red, &mut pixels);
+    let blue_slot = resolve(&mut cache, 2, &blue, &mut pixels);
+    assert_ne!(red_slot, blue_slot);
+    assert_eq!(pixels[red_slot], [255, 0, 0, 255]);
+    assert_eq!(pixels[blue_slot], [0, 0, 255, 255]);
+
+    let pixel_generation = red.kitty_image_generation();
+    for terminal in [&mut red, &mut blue] {
+        terminal.process(b"\x1b[2;1H\n");
+        assert_eq!(terminal.kitty_placements()[0].row, -1);
+        assert_eq!(terminal.kitty_image_generation(), pixel_generation);
+    }
+    assert_eq!(resolve(&mut cache, 1, &red, &mut pixels), red_slot);
+    assert_eq!(resolve(&mut cache, 2, &blue, &mut pixels), blue_slot);
+    assert_eq!(pixels.len(), 2, "scrolling must not reupload either image");
+
+    red.process(b"\x1b_Ga=T,i=7,f=32,s=1,v=1,c=1,r=1;AP8A/w==\x1b\\");
+    let green_slot = resolve(&mut cache, 1, &red, &mut pixels);
+    assert_eq!(pixels[green_slot], [0, 255, 0, 255]);
+    assert_eq!(resolve(&mut cache, 2, &blue, &mut pixels), blue_slot);
+    assert_eq!(
+        pixels.len(),
+        3,
+        "replacement invalidates only its own surface cache"
+    );
+}
 
 #[derive(Clone)]
 struct TestAtlasTexture {
@@ -309,6 +376,62 @@ fn image_quad_destination_clipping_preserves_source_offset() {
     assert_eq!(sample_rgb(&buffer, 2, 1, 2), 0x10_0000);
 }
 
+#[test]
+fn gpu_image_sampling_crops_negative_top_bottom_and_fractional_scroll() {
+    let mut terminal = Terminal::new(1, 3);
+    terminal.process(b"\x1b_Ga=T,i=7,f=32,s=1,v=4,c=1,r=1;/wAA/wD/AP8AAP///////w==\x1b\\");
+    terminal.kitty_placements[0].rows = 4;
+    let image = terminal.kitty_image(7).unwrap();
+    let textures = std::collections::HashMap::from([(
+        (0, 0, 1, 4),
+        TestAtlasTexture {
+            pixels: image.data.clone(),
+            width: 1,
+            height: 4,
+        },
+    )]);
+    for (row, scroll_rows, expected) in [
+        (
+            -1,
+            0.0,
+            [0x00ff00, 0x00ff00, 0x0000ff, 0x0000ff, 0xffffff, 0xffffff],
+        ),
+        (1, 0.0, [0, 0, 0xff0000, 0xff0000, 0x00ff00, 0x00ff00]),
+        (
+            -1,
+            0.5,
+            [0xff0000, 0x00ff00, 0x00ff00, 0x0000ff, 0x0000ff, 0xffffff],
+        ),
+        (
+            -1,
+            1.0,
+            [0xff0000, 0xff0000, 0x00ff00, 0x00ff00, 0x0000ff, 0x0000ff],
+        ),
+    ] {
+        terminal.kitty_placements[0].row = row;
+        let mut instances = Vec::new();
+        fill_terminal_image_instances_with_scroll(
+            &terminal,
+            1.0,
+            2.0,
+            ViewportScroll::from_scroll_rows(scroll_rows),
+            [0.0, 0.0, 1.0, 6.0],
+            &mut instances,
+            |_| {
+                Some(AtlasImageRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 4,
+                })
+            },
+        );
+        let mut pixels = vec![0; 6];
+        draw_image_instances(&mut pixels, 1, 6, &instances, &textures);
+        assert_eq!(pixels, expected, "anchor={row}, scroll={scroll_rows}");
+    }
+}
+
 fn render_like_gpu_with_scroll(
     terminal: &mut Terminal,
     atlas: &mut GlyphAtlas,
@@ -404,66 +527,36 @@ fn render_like_gpu_with_scroll(
 
     let mut image_textures = std::collections::HashMap::new();
     let mut image_instances = Vec::new();
-    if viewport_scroll == ViewportScroll::ZERO {
-        fill_image_instances(
-            terminal.kitty_placements(),
-            atlas.cell_width as f32,
-            atlas.cell_height as f32,
-            &mut image_instances,
-            |placement| {
-                let image = terminal.kitty_image(placement.image_id)?;
-                if image.data.len() != (image.width as usize) * (image.height as usize) * 4 {
-                    return None;
-                }
-                let rect = AtlasImageRect {
-                    x: next_x,
-                    y: 1,
+    fill_terminal_image_instances_with_scroll(
+        terminal,
+        atlas.cell_width as f32,
+        atlas.cell_height as f32,
+        viewport_scroll,
+        [0.0, 0.0, width as f32, height as f32],
+        &mut image_instances,
+        |placement| {
+            let image = terminal.kitty_image(placement.image_id)?;
+            if image.data.len() != (image.width as usize) * (image.height as usize) * 4 {
+                return None;
+            }
+            let rect = AtlasImageRect {
+                x: next_x,
+                y: 1,
+                width: image.width,
+                height: image.height,
+            };
+            image_textures.insert(
+                (rect.x, rect.y, rect.width, rect.height),
+                TestAtlasTexture {
+                    pixels: image.data.clone(),
                     width: image.width,
                     height: image.height,
-                };
-                image_textures.insert(
-                    (rect.x, rect.y, rect.width, rect.height),
-                    TestAtlasTexture {
-                        pixels: image.data.clone(),
-                        width: image.width,
-                        height: image.height,
-                    },
-                );
-                next_x = next_x.saturating_add(image.width.max(1) + 1);
-                Some(rect)
-            },
-        );
-    } else {
-        fill_image_instances_with_viewport_offset(
-            terminal.kitty_placements(),
-            atlas.cell_width as f32,
-            atlas.cell_height as f32,
-            viewport_scroll.live_grid_offset_y(atlas.cell_height as f32),
-            &mut image_instances,
-            |placement| {
-                let image = terminal.kitty_image(placement.image_id)?;
-                if image.data.len() != (image.width as usize) * (image.height as usize) * 4 {
-                    return None;
-                }
-                let rect = AtlasImageRect {
-                    x: next_x,
-                    y: 1,
-                    width: image.width,
-                    height: image.height,
-                };
-                image_textures.insert(
-                    (rect.x, rect.y, rect.width, rect.height),
-                    TestAtlasTexture {
-                        pixels: image.data.clone(),
-                        width: image.width,
-                        height: image.height,
-                    },
-                );
-                next_x = next_x.saturating_add(image.width.max(1) + 1);
-                Some(rect)
-            },
-        );
-    }
+                },
+            );
+            next_x = next_x.saturating_add(image.width.max(1) + 1);
+            Some(rect)
+        },
+    );
 
     draw_cell_instances(
         &mut buffer,

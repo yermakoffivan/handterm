@@ -127,7 +127,7 @@ pub(crate) fn fill_frame_plan(terminal: &impl TerminalView, plan: &mut FramePlan
             .saturating_sub(plan.image_placements.capacity()),
     );
     plan.image_placements
-        .extend_from_slice(terminal.kitty_placements());
+        .extend(terminal.kitty_viewport_placements());
 }
 
 pub(crate) fn fill_cell_infos(terminal: &impl TerminalView, cell_infos: &mut Vec<CellInfo>) {
@@ -665,37 +665,50 @@ pub(crate) fn fill_image_instances_with_viewport_offset<F>(
     }
 }
 
-pub(crate) fn fill_image_instances_with_history<F>(
-    placements: &[KittyPlacement],
+/// Project using the same sampled history row and fractional displacement as
+/// text. Preserve the full image rectangle and UVs: GPU viewport clipping must
+/// crop the source rather than rescale it into the visible portion.
+/// `viewport_bounds` is [left, top, right, bottom] in image coordinates, after
+/// removing the shader's grid offset from the physical surface bounds.
+pub(crate) fn fill_terminal_image_instances_with_scroll<F>(
+    terminal: &impl TerminalView,
     cell_w: f32,
     cell_h: f32,
-    history_rows: u64,
     viewport_scroll: ViewportScroll,
-    visible_rows: usize,
+    viewport_bounds: [f32; 4],
     image_instances: &mut Vec<ImageInstance>,
     mut image_rect_for: F,
 ) where
     F: FnMut(&KittyPlacement) -> Option<AtlasImageRect>,
 {
-    let sampled_top = history_rows.saturating_sub(viewport_scroll.sample_offset as u64);
-    let sampled_bottom = sampled_top.saturating_add(visible_rows as u64);
-    let fractional_offset_y = viewport_scroll.viewport_offset_y(cell_h);
     image_instances.clear();
-    image_instances.reserve(placements.len().saturating_sub(image_instances.capacity()));
-    for placement in placements {
-        let placement_bottom = placement.row.saturating_add(placement.rows.max(1) as u64);
-        if placement_bottom <= sampled_top || placement.row >= sampled_bottom {
+    for placement in terminal.kitty_viewport_placements_at_scroll(viewport_scroll.sample_offset) {
+        let pos = [
+            placement.col as f32 * cell_w,
+            placement.row as f32 * cell_h + viewport_scroll.viewport_offset_y(cell_h),
+        ];
+        let size = [
+            placement.cols.max(1) as f32 * cell_w,
+            placement.rows.max(1) as f32 * cell_h,
+        ];
+        // Cull in destination pixels, after the fractional scroll displacement.
+        // Do not ask the atlas to resolve/upload invisible history images.
+        if !(viewport_bounds[2] > viewport_bounds[0]
+            && viewport_bounds[3] > viewport_bounds[1]
+            && pos[0] < viewport_bounds[2]
+            && pos[1] < viewport_bounds[3]
+            && pos[0] + size[0] > viewport_bounds[0]
+            && pos[1] + size[1] > viewport_bounds[1])
+        {
             continue;
         }
-        if let Some(entry) = image_rect_for(placement) {
-            let mut instance = image_instance_for_placement(placement, entry, cell_w, cell_h);
-            let relative_rows = if placement.row >= sampled_top {
-                (placement.row - sampled_top) as f64
-            } else {
-                -((sampled_top - placement.row) as f64)
-            };
-            instance.pos[1] = (relative_rows * cell_h as f64) as f32 + fractional_offset_y;
-            image_instances.push(instance);
+        if let Some(entry) = image_rect_for(&placement) {
+            image_instances.push(ImageInstance {
+                pos,
+                size,
+                uv_offset: [entry.x as f32, entry.y as f32],
+                uv_size: [entry.width as f32, entry.height as f32],
+            });
         }
     }
 }
@@ -797,67 +810,6 @@ mod tests {
         assert_eq!(exact.extra_visible_rows(), 0);
         assert_eq!(exact.viewport_offset_y(16.0), 0.0);
         assert_eq!(exact.live_grid_offset_y(16.0), 32.0);
-    }
-
-    #[test]
-    fn ordinary_kitty_placement_tracks_output_and_fractional_history() {
-        fn rect_for(_: &KittyPlacement) -> Option<AtlasImageRect> {
-            Some(AtlasImageRect {
-                x: 100,
-                y: 200,
-                width: 24,
-                height: 32,
-            })
-        }
-
-        let placement = KittyPlacement {
-            image_id: 7,
-            col: 2,
-            row: 1,
-            cols: 3,
-            rows: 2,
-        };
-        let mut instances = Vec::new();
-
-        fill_image_instances_with_history(
-            std::slice::from_ref(&placement),
-            8.0,
-            16.0,
-            2,
-            ViewportScroll::ZERO,
-            2,
-            &mut instances,
-            rect_for,
-        );
-        assert_eq!(instances.len(), 1);
-        assert_eq!(instances[0].pos, [16.0, -16.0]);
-
-        fill_image_instances_with_history(
-            std::slice::from_ref(&placement),
-            8.0,
-            16.0,
-            2,
-            ViewportScroll::from_scroll_rows(1.0),
-            2,
-            &mut instances,
-            rect_for,
-        );
-        assert_eq!(instances[0].pos, [16.0, 0.0]);
-
-        fill_image_instances_with_history(
-            std::slice::from_ref(&placement),
-            8.0,
-            16.0,
-            2,
-            ViewportScroll::from_scroll_rows(1.25),
-            3,
-            &mut instances,
-            rect_for,
-        );
-        assert_eq!(instances[0].pos, [16.0, 4.0]);
-        assert_eq!(instances[0].size, [24.0, 32.0]);
-        assert_eq!(instances[0].uv_offset, [100.0, 200.0]);
-        assert_eq!(instances[0].uv_size, [24.0, 32.0]);
     }
 
     #[test]
@@ -1116,6 +1068,154 @@ mod tests {
         assert_eq!(images[0].size, [4.0, 16.0]);
         assert_eq!(images[0].uv_offset, [100.0, 200.0]);
         assert_eq!(images[0].uv_size, [4.0, 16.0]);
+    }
+
+    #[test]
+    fn projected_gpu_images_keep_full_uvs_for_top_and_bottom_clipping() {
+        let mut terminal = Terminal::new(4, 3);
+        terminal.kitty_placements.push(KittyPlacement {
+            image_id: 7,
+            col: 1,
+            row: -1,
+            cols: 2,
+            rows: 4,
+        });
+        let mut instances = Vec::new();
+        for row in [-1, 2] {
+            terminal.kitty_placements[0].row = row;
+            fill_terminal_image_instances_with_scroll(
+                &terminal,
+                8.0,
+                16.0,
+                ViewportScroll::ZERO,
+                [0.0, 0.0, 32.0, 48.0],
+                &mut instances,
+                |_| {
+                    Some(AtlasImageRect {
+                        x: 10,
+                        y: 20,
+                        width: 12,
+                        height: 40,
+                    })
+                },
+            );
+            assert_eq!(instances.len(), 1);
+            assert_eq!(instances[0].pos, [8.0, row as f32 * 16.0]);
+            assert_eq!(instances[0].size, [16.0, 64.0]);
+            assert_eq!(instances[0].uv_offset, [10.0, 20.0]);
+            assert_eq!(instances[0].uv_size, [12.0, 40.0]);
+        }
+    }
+
+    #[test]
+    fn offscreen_history_images_do_not_resolve_atlas_or_allocate_instances() {
+        let mut terminal = Terminal::new(4, 3);
+        for (col, row, rows) in [(0, -2, 2), (0, 3, 1), (4, 0, 1)] {
+            terminal.kitty_placements.push(KittyPlacement {
+                image_id: 7,
+                col,
+                row,
+                cols: 1,
+                rows,
+            });
+        }
+        let mut images = Vec::new();
+        fill_terminal_image_instances_with_scroll(
+            &terminal,
+            8.0,
+            16.0,
+            ViewportScroll::ZERO,
+            [0.0, 0.0, 32.0, 48.0],
+            &mut images,
+            |_| panic!("fully offscreen placement must not resolve/upload an atlas entry"),
+        );
+        assert!(images.is_empty());
+        assert_eq!(images.capacity(), 0);
+
+        // A fractional scroll reveals four pixels of the top placement. It
+        // must now resolve, while the bottom and right placements stay culled.
+        let mut resolutions = 0;
+        fill_terminal_image_instances_with_scroll(
+            &terminal,
+            8.0,
+            16.0,
+            ViewportScroll::from_scroll_rows(0.25),
+            [0.0, 0.0, 32.0, 48.0],
+            &mut images,
+            |_| {
+                resolutions += 1;
+                Some(AtlasImageRect {
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 32,
+                })
+            },
+        );
+        assert_eq!(resolutions, 1);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].pos, [0.0, -28.0]);
+        assert_eq!(images[0].size, [8.0, 32.0]);
+        assert_eq!(images[0].uv_size, [8.0, 32.0]);
+
+        // Shader padding shifts the physical viewport into negative image
+        // coordinates. Pixels visible in that padding must not be culled.
+        fill_terminal_image_instances_with_scroll(
+            &terminal,
+            8.0,
+            16.0,
+            ViewportScroll::ZERO,
+            [-4.0, -4.0, 28.0, 44.0],
+            &mut images,
+            |_| {
+                Some(AtlasImageRect {
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 32,
+                })
+            },
+        );
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].pos, [0.0, -32.0]);
+    }
+
+    #[test]
+    fn history_image_fractional_scroll_tracks_its_text_anchor() {
+        let mut terminal = Terminal::new_with_scrollback(4, 3, 8);
+        terminal.process(b"\x1b_Ga=T,i=7,f=32,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\");
+        terminal.process(b"\x1b[HA\r\nB\r\nC\r\nD\r\nE");
+        assert_eq!(terminal.kitty_placements()[0].row, -2);
+        // Explicit GPU sampling must not double-add the integer CPU viewport.
+        terminal.grid.scroll_offset = 1;
+        for scroll_rows in [1.25, 1.75, 2.0] {
+            let scroll = ViewportScroll::from_scroll_rows(scroll_rows);
+            let mut cells = Vec::new();
+            fill_cell_infos_with_scroll(&terminal, &mut cells, scroll);
+            let anchor = cells.iter().find(|cell| cell.ch == 'A' as u32).unwrap();
+            let text_y = anchor.row as f32 * 16.0 + scroll.viewport_offset_y(16.0);
+            let mut images = Vec::new();
+            fill_terminal_image_instances_with_scroll(
+                &terminal,
+                8.0,
+                16.0,
+                scroll,
+                [0.0, 0.0, 32.0, 48.0],
+                &mut images,
+                |_| {
+                    Some(AtlasImageRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    })
+                },
+            );
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].pos[1], text_y);
+            assert_eq!(images[0].pos[1], (scroll_rows - 2.0) * 16.0);
+            assert_eq!(images[0].size, [8.0, 16.0]);
+        }
     }
 
     #[test]
@@ -1510,14 +1610,13 @@ mod tests {
             }
         }
 
-        for placement in terminal.kitty_placements() {
+        for placement in terminal.kitty_viewport_placements() {
             mark_cells_for_pixel_rect(
                 &mut gpu_visible,
                 (cols, rows),
                 (
                     (placement.col * atlas.cell_width) as i32,
-                    (usize::try_from(placement.row).expect("test placement row fits usize")
-                        * atlas.cell_height) as i32,
+                    (placement.row * atlas.cell_height as i64) as i32,
                     placement.cols.max(1) * atlas.cell_width,
                     placement.rows.max(1) * atlas.cell_height,
                 ),

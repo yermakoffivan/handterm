@@ -5,7 +5,7 @@ use crate::gpu_frame::{
     AtlasImageRect, CellInfo, CellInstance, FrameBatchStyle, FrameTextBatches, GlyphAtlasEntry,
     ImageInstance, append_scrollbar_overlay_instances, append_virtual_image_instances,
     apply_pane_visual_scroll, fill_cell_infos, fill_cell_infos_with_scroll,
-    fill_image_instances_with_history, fill_text_batches,
+    fill_terminal_image_instances_with_scroll, fill_text_batches,
 };
 use crate::kitty_placeholders::fill_kitty_virtual_cells;
 use crate::native_scroll::{PaneKind, PaneVisualScroll};
@@ -1176,15 +1176,19 @@ pub fn render_surface_state_profiled_with_scroll(
         );
     }
 
-    let image_placements = terminal.kitty_placements().to_vec();
     let mut image_instances = std::mem::take(&mut state.image_instances);
-    fill_image_instances_with_history(
-        &image_placements,
+    let image_padding = config.window.padding_px(atlas.dpi()) as f32;
+    fill_terminal_image_instances_with_scroll(
+        terminal,
         cell_w,
         cell_h,
-        terminal.grid().history_rows(),
         viewport_scroll,
-        terminal.grid().rows + viewport_scroll.extra_visible_rows(),
+        [
+            -image_padding,
+            -image_padding,
+            state.surface_config.width as f32 - image_padding,
+            state.surface_config.height as f32 - image_padding,
+        ],
         &mut image_instances,
         |placement| {
             ensure_kitty_image_in_atlas(
@@ -1630,7 +1634,7 @@ fn ensure_kitty_image_in_atlas<'a>(
     image_id: u32,
 ) -> Option<&'a GpuImageEntry> {
     let key = (image_namespace, image_id);
-    let generation = terminal.kitty_generation();
+    let generation = terminal.kitty_image_generation();
     let image = terminal.kitty_image(image_id)?;
     if !kitty_image_is_uploadable(image) {
         return None;

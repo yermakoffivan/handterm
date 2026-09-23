@@ -36,7 +36,9 @@ pub enum UnderlineStyle {
     Dashed = 5,
 }
 
-pub const COLOR_DEFAULT: u32 = 0;
+/// Default theme color, distinct from every indexed color (including black).
+/// Serialized cells must be exchanged with peers using the same encoding.
+pub const COLOR_DEFAULT: u32 = 0x4000_0000;
 pub const COLOR_FLAG_RGB: u32 = 0x8000_0000;
 
 pub const ATTR_BOLD: u8 = 0x01;
@@ -186,6 +188,25 @@ fn clone_optional_slice<T: Clone>(slice: &mut [Option<T>], src: usize, dest: usi
     }
 }
 
+/// Bounded damage record for overlays. Terminal consumes this between actions.
+/// Mixed direct Grid operations conservatively invalidate overlays instead of
+/// accumulating an unbounded queue of scroll events.
+#[derive(Clone, Copy)]
+pub(crate) enum ScrollDamage {
+    /// Full-screen upward scroll whose rows entered bounded text history.
+    History {
+        rows: usize,
+    },
+    /// History was cleared or grid dimensions changed.
+    Prune,
+    Region {
+        top: usize,
+        bottom: usize,
+        delta: isize,
+    },
+    Clear,
+}
+
 pub struct Grid {
     pub cols: usize,
     pub rows: usize,
@@ -214,6 +235,7 @@ pub struct Grid {
     dirty: Vec<u64>,
     pub all_dirty: bool,
     generation: u64,
+    scroll_damage: Option<ScrollDamage>,
     scrollback: Vec<Cell>,
     scrollback_graphemes: Vec<Option<Box<str>>>,
     scrollback_len: usize,
@@ -276,6 +298,7 @@ impl Grid {
             dirty: vec![!0u64; dirty_words],
             all_dirty: true,
             generation: 1,
+            scroll_damage: None,
             scrollback: Vec::new(),
             scrollback_graphemes: Vec::new(),
             scrollback_len: 0,
@@ -315,11 +338,36 @@ impl Grid {
             }
         }
 
+        // History is not reflowed, just truncated/padded exactly like live rows.
+        // Preserve physical ring order/head so viewport and overlay anchors remain
+        // stable even when the ring is full and wrapped.
+        if new_cols != old_cols {
+            let mut history = vec![Cell::BLANK; self.scrollback_len * new_cols];
+            let mut graphemes = if self.has_graphemes {
+                vec![None; history.len()]
+            } else {
+                Vec::new()
+            };
+            for row in 0..self.scrollback_len {
+                let src = row * old_cols;
+                let dst = row * new_cols;
+                history[dst..dst + copy_cols]
+                    .copy_from_slice(&self.scrollback[src..src + copy_cols]);
+                if let Some(source) = self.scrollback_graphemes.get(src..src + copy_cols) {
+                    graphemes[dst..dst + copy_cols].clone_from_slice(source);
+                }
+            }
+            self.scrollback = history;
+            self.scrollback_graphemes = graphemes;
+        }
         self.cells = new_cells;
         self.graphemes = new_graphemes;
         self.cols = new_cols;
         self.rows = new_rows;
         self.top_row = 0;
+        self.scroll_damage = Some(ScrollDamage::Prune);
+        self.scroll_offset = self.scroll_offset.min(self.scrollback_len);
+        self.selection = None;
         self.scroll_top = 0;
         self.scroll_bottom = new_rows;
         self.cursor_col = self.cursor_col.min(new_cols.saturating_sub(1));
@@ -333,6 +381,58 @@ impl Grid {
 
     pub fn cursor_pos(&self) -> (usize, usize) {
         (self.cursor_col, self.cursor_row)
+    }
+
+    pub(crate) fn take_scroll_damage(&mut self) -> Option<ScrollDamage> {
+        self.scroll_damage.take()
+    }
+
+    /// Drop history, including its old column stride, and reset viewport state.
+    pub fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
+        self.scrollback_graphemes.clear();
+        self.scrollback_len = 0;
+        self.scrollback_head = 0;
+        self.scroll_offset = 0;
+        self.selection = None;
+        self.scroll_damage = Some(ScrollDamage::Prune);
+        self.mark_all_dirty();
+    }
+
+    fn record_scroll(&mut self, delta: isize) {
+        let top = self.scroll_top;
+        let bottom = self.scroll_bottom;
+        if delta < 0 && top == 0 && bottom == self.rows && self.scrollback_max > 0 {
+            self.scroll_damage = Some(match self.scroll_damage {
+                None => ScrollDamage::History {
+                    rows: delta.unsigned_abs(),
+                },
+                Some(ScrollDamage::History { rows }) => ScrollDamage::History {
+                    rows: rows.saturating_add(delta.unsigned_abs()),
+                },
+                _ => ScrollDamage::Clear,
+            });
+            return;
+        }
+        self.scroll_damage = Some(match self.scroll_damage {
+            None => ScrollDamage::Region { top, bottom, delta },
+            Some(ScrollDamage::Region {
+                top: old_top,
+                bottom: old_bottom,
+                delta: old_delta,
+            }) if top == old_top
+                && bottom == old_bottom
+                && delta.signum() == old_delta.signum() =>
+            {
+                let height = bottom.saturating_sub(top) as isize;
+                ScrollDamage::Region {
+                    top,
+                    bottom,
+                    delta: old_delta.saturating_add(delta).clamp(-height, height),
+                }
+            }
+            _ => ScrollDamage::Clear,
+        });
     }
 
     #[inline(always)]
@@ -859,6 +959,7 @@ impl Grid {
 
     #[inline(always)]
     fn scroll_up_ring(&mut self) {
+        self.record_scroll(-1);
         let cols = self.cols;
         let old_top = self.top_row;
         let blank_start = old_top * cols;
@@ -1346,6 +1447,7 @@ impl Grid {
         if self.rows == 0 || self.cols == 0 {
             return;
         }
+        self.record_scroll(-1);
 
         if self.scroll_top == 0 && self.scroll_bottom == self.rows {
             let old_top = self.physical_row(0);
@@ -1385,6 +1487,7 @@ impl Grid {
         if self.rows == 0 || self.cols == 0 {
             return;
         }
+        self.record_scroll(1);
 
         let cols = self.cols;
         let has_graphemes = self.has_graphemes;
@@ -1886,5 +1989,56 @@ mod tests {
         );
         // The dense cell array is still retained, as expected.
         assert!(g.scrollback_memory_bytes() >= lines * cols);
+    }
+
+    #[test]
+    fn resize_preserves_wrapped_history_rows_and_graphemes() {
+        let mut grid = Grid::new_with_scrollback(4, 2, [0; 3], [0; 3], 3);
+        for line in ["a\u{301}aaa", "bbbb", "cccc", "dddd", "eeee"] {
+            grid.write_bytes(line.as_bytes());
+            grid.carriage_return();
+            grid.line_feed();
+        }
+        assert_eq!(grid.scrollback_len(), 3);
+        let before: Vec<_> = (0..3)
+            .map(|r| grid.cell_at_scrollback_offset(3, r, 0).ch)
+            .collect();
+        grid.scroll_offset = 3;
+        grid.resize(6, 3);
+        assert_eq!(grid.scrollback_len(), 3);
+        assert_eq!(grid.scroll_offset, 3);
+        for (r, expected) in before.iter().enumerate() {
+            assert_eq!(grid.cell_at_scroll(r, 0).ch, *expected);
+            assert_eq!(grid.cell_at_scroll(r, 4).ch, b' ' as u32);
+        }
+        grid.resize(2, 2);
+        for (r, expected) in before.iter().enumerate() {
+            assert_eq!(grid.cell_at_scrollback_offset(3, r, 0).ch, *expected);
+        }
+        grid.write_bytes(b"ff");
+        grid.line_feed();
+        assert_eq!(grid.scrollback_len(), 3);
+    }
+
+    #[test]
+    fn resize_preserves_history_graphemes_and_handles_late_grapheme_storage() {
+        let mut grid = Grid::new_with_scrollback(4, 2, [0; 3], [0; 3], 3);
+        grid.write_bytes("a\u{301}".as_bytes());
+        grid.carriage_return();
+        grid.line_feed();
+        grid.line_feed();
+        grid.resize(6, 2);
+        assert_eq!(
+            grid.cell_grapheme_at_scrollback_offset(1, 0, 0),
+            Some("a\u{301}")
+        );
+
+        let mut grid = Grid::new_with_scrollback(4, 2, [0; 3], [0; 3], 3);
+        grid.write_bytes(b"abcdefghi");
+        assert_eq!(grid.scrollback_len(), 1);
+        grid.write_bytes("x\u{301}".as_bytes()); // History still has no grapheme backing.
+        grid.resize(6, 2);
+        assert_eq!(grid.cell_at_scrollback_offset(1, 0, 0).ch, b'a' as u32);
+        assert_eq!(grid.cell_grapheme_at_scrollback_offset(1, 0, 0), None);
     }
 }
